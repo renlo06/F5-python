@@ -12,8 +12,11 @@ Produit dans captures/<label>_<phase>_<horodatage>/ :
     state_summary.json                                  (données structurées)
 
 Usage:
-    python capture_state.py --host 10.0.0.1 --label bigip-a --phase before
+    python capture_state.py                       (état et équipement demandés)
+    python capture_state.py --host 10.0.0.1 --label bigip-a
     python capture_state.py -f equipements.txt --phase after
+
+Si --phase n'est pas fourni, l'état (before / after) est demandé au lancement.
 
 Format du fichier -f (une ligne par équipement, # = commentaire) :
     label;host;utilisateur[;port]
@@ -45,6 +48,35 @@ COMMANDES_TMSH = [
     ("state_pool.txt",    "show ltm pool /*/* members field-fmt"),
     ("state_node.txt",    "show ltm node /*/* field-fmt"),
 ]
+
+
+# ------------------------------------------------------- Saisie interactive
+
+def demander_phase() -> str:
+    """Demande l'état de la capture : before ou after."""
+    print("Quel est l'état de cette capture ?")
+    print("  1) before (avant l'intervention)")
+    print("  2) after  (après l'intervention)")
+    while True:
+        choix = input("Choix [1/2 ou before/after] : ").strip().lower()
+        if choix in ("1", "before", "b", "avant"):
+            return "before"
+        if choix in ("2", "after", "a", "apres", "après"):
+            return "after"
+        print("Réponse invalide, tape 1, 2, before ou after.")
+
+
+def demander_equipement():
+    """Demande label / host / user / port pour un équipement unique."""
+    label = input("Nom de l'équipement (label) : ").strip()
+    host = input("Adresse IP ou nom d'hôte : ").strip()
+    user = input("Utilisateur [admin] : ").strip() or "admin"
+    port_saisi = input("Port SSH [22] : ").strip()
+    port = int(port_saisi) if port_saisi else 22
+    if not label or not host:
+        print("Le label et l'hôte sont obligatoires.")
+        sys.exit(2)
+    return [(label, host, user, port)]
 
 
 # ---------------------------------------------------------------- SSH
@@ -234,7 +266,8 @@ def lire_fichier_equipements(chemin: str):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Capture de l'état runtime BIG-IP.")
-    parser.add_argument("--phase", required=True, choices=["before", "after"])
+    parser.add_argument("--phase", choices=["before", "after"],
+                        help="état de la capture (demandé si absent)")
     parser.add_argument("--host")
     parser.add_argument("--label")
     parser.add_argument("--user", default="admin")
@@ -243,16 +276,22 @@ def main() -> int:
     parser.add_argument("--captures", default=REPERTOIRE_CAPTURES)
     args = parser.parse_args()
 
+    # 1) État before / after : demandé si non fourni
+    phase = args.phase or demander_phase()
+
+    # 2) Équipements : fichier, arguments, ou saisie interactive
     if args.fichier:
         equipements = lire_fichier_equipements(args.fichier)
     elif args.host and args.label:
         equipements = [(args.label, args.host, args.user, args.port)]
     else:
-        parser.error("Fournir --host et --label, ou -f fichier.")
+        equipements = demander_equipement()
 
     if not equipements:
         print("Aucun équipement à traiter.")
         return 2
+
+    print("\nPhase : {} | {} équipement(s)".format(phase.upper(), len(equipements)))
 
     password = os.environ.get("BIGIP_PASSWORD") or getpass.getpass("Mot de passe : ")
     racine = Path(args.captures)
@@ -260,10 +299,10 @@ def main() -> int:
 
     erreurs = 0
     for label, host, user, port in equipements:
-        print("=== {} ({}) - phase {} ===".format(label, host, args.phase))
+        print("=== {} ({}) - phase {} ===".format(label, host, phase))
         try:
             dossier = capturer_equipement(label, host, port, user, password,
-                                          args.phase, racine)
+                                          phase, racine)
             print("  -> {}".format(dossier))
         except Exception as exc:  # noqa: BLE001
             erreurs += 1
