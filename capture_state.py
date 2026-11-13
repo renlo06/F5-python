@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Capture de l'état runtime de BIG-IP (avant / après une intervention).
+"""Capture de l'état (statut uniquement) des VS, pools et pool members BIG-IP.
 
-Relève, pour TOUTES les partitions :
-    - virtual servers
-    - pools et membres
-    - nodes
+Ne collecte QUE l'état, sans aucune statistique (connexions, octets, paquets) :
+    - virtual servers : disponibilité, état activé/désactivé, raison
+    - pools           : disponibilité, état activé/désactivé
+    - pool members    : disponibilité, état activé/désactivé, raison
 
 Produit dans captures/<label>_<phase>_<horodatage>/ :
-    state_virtual.txt, state_pool.txt, state_node.txt   (sorties brutes tmsh)
-    state_summary.json                                  (données structurées)
+    state_virtual.txt   (sortie brute filtrée : lignes de statut uniquement)
+    state_pool.txt      (sortie brute filtrée : lignes de statut uniquement)
+    state_summary.json  (données structurées)
 
 Usage:
     python capture_state.py -f hosts.txt
@@ -54,8 +55,16 @@ PORT_DEFAUT = 22
 COMMANDES_TMSH = [
     ("state_virtual.txt", "show ltm virtual /*/* field-fmt"),
     ("state_pool.txt",    "show ltm pool /*/* members field-fmt"),
-    ("state_node.txt",    "show ltm node /*/* field-fmt"),
 ]
+
+# Seules ces lignes sont conservées dans les fichiers texte : tout le reste
+# (compteurs, octets, paquets, connexions...) est ignoré.
+CHAMPS_STATUT = (
+    "status.availability-state",
+    "status.enabled-state",
+    "status.status-reason",
+    "destination",
+)
 
 # (label, host, user ou None, port)
 Equipement = Tuple[str, str, Optional[str], int]
@@ -232,6 +241,28 @@ def champ(lignes: List[str], nom: str) -> Optional[str]:
     return None
 
 
+def filtrer_statut(texte: str, entete: str) -> str:
+    """Ne conserve que les lignes d'identification et de statut.
+
+    Garde les lignes d'en-tête d'objet (ex. 'ltm virtual /Common/vs1 {'),
+    les accolades fermantes, les noms de membres et les champs de CHAMPS_STATUT.
+    Toutes les statistiques (compteurs, octets, paquets...) sont supprimées."""
+    gardees: List[str] = []
+    for ligne in texte.splitlines():
+        brut = ligne.strip()
+        if not brut:
+            continue
+        if brut.startswith(entete + " "):
+            gardees.append(ligne)
+        elif brut == "}":
+            gardees.append(ligne)
+        elif re.match(r"^\S+\s*\{$", brut):          # nom de membre : 'x:80 {'
+            gardees.append(ligne)
+        elif any(brut.startswith(c + " ") for c in CHAMPS_STATUT):
+            gardees.append(ligne)
+    return "\n".join(gardees) + "\n"
+
+
 def parser_virtuals(texte: str) -> List[Dict[str, Optional[str]]]:
     resultat = []
     for bloc in decouper_blocs(texte, "ltm virtual"):
@@ -253,8 +284,7 @@ def parser_pools(texte: str) -> List[Dict[str, object]]:
         membres = []
         courant: Optional[Dict[str, Optional[str]]] = None
         for ligne in bloc[1:]:
-            m = re.match(r"^\s*ltm pool \S+ members \{", ligne)
-            if m:
+            if re.match(r"^\s*ltm pool \S+ members \{", ligne):
                 continue
             m = re.match(r"^\s{4}(\S+)\s*\{\s*$", ligne)
             if m:
@@ -279,20 +309,6 @@ def parser_pools(texte: str) -> List[Dict[str, object]]:
     return resultat
 
 
-def parser_nodes(texte: str) -> List[Dict[str, Optional[str]]]:
-    resultat = []
-    for bloc in decouper_blocs(texte, "ltm node"):
-        nom = bloc[0].split()[2]
-        resultat.append({
-            "nom": nom,
-            "adresse": champ(bloc, "addr"),
-            "disponibilite": champ(bloc, "status.availability-state"),
-            "etat": champ(bloc, "status.enabled-state"),
-            "raison": champ(bloc, "status.status-reason"),
-        })
-    return resultat
-
-
 # ---------------------------------------------------------------- Capture
 
 def assainir(nom: str) -> str:
@@ -307,6 +323,11 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
     dossier = racine / "{}_{}_{}".format(assainir(label), phase, horodatage)
     dossier.mkdir(parents=True, exist_ok=True)
 
+    entetes = {
+        "state_virtual.txt": "ltm virtual",
+        "state_pool.txt": "ltm pool",
+    }
+
     client = connecter(host, port, user, password)
     try:
         shell = detecter_shell(client)
@@ -314,10 +335,11 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
 
         sorties: Dict[str, str] = {}
         for fichier, commande in COMMANDES_TMSH:
-            texte = executer_tmsh(client, commande, shell)
-            (dossier / fichier).write_text(texte, encoding="utf-8")
-            sorties[fichier] = texte
-            print("  [OK] {:<20} {} octets".format(fichier, len(texte)))
+            brut = executer_tmsh(client, commande, shell)
+            sorties[fichier] = brut                       # pour le parsing
+            filtre = filtrer_statut(brut, entetes[fichier])
+            (dossier / fichier).write_text(filtre, encoding="utf-8")
+            print("  [OK] {:<20} {} octets".format(fichier, len(filtre)))
     finally:
         client.close()
 
@@ -329,13 +351,13 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
         "shell": shell,
         "virtuals": parser_virtuals(sorties["state_virtual.txt"]),
         "pools": parser_pools(sorties["state_pool.txt"]),
-        "nodes": parser_nodes(sorties["state_node.txt"]),
     }
     (dossier / "state_summary.json").write_text(
         json.dumps(resume, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    print("  Virtuals: {}  Pools: {}  Nodes: {}".format(
-        len(resume["virtuals"]), len(resume["pools"]), len(resume["nodes"])))
+    nb_membres = sum(len(p["membres"]) for p in resume["pools"])
+    print("  Virtuals: {}  Pools: {}  Membres: {}".format(
+        len(resume["virtuals"]), len(resume["pools"]), nb_membres))
     return dossier
 
 
@@ -343,7 +365,7 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Capture de l'état runtime de BIG-IP (before / after).")
+        description="Capture de l'état (VS, pools, membres) de BIG-IP.")
     parser.add_argument("-f", "--fichier",
                         help="fichier d'équipements (label;host;user;port)")
     parser.add_argument("--host", help="équipement unique (IP ou nom)")
