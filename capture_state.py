@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Capture de l'état runtime d'un BIG-IP (avant / après une intervention).
+"""Capture de l'état runtime de BIG-IP (avant / après une intervention).
 
 Relève, pour TOUTES les partitions :
     - virtual servers
@@ -12,16 +12,20 @@ Produit dans captures/<label>_<phase>_<horodatage>/ :
     state_summary.json                                  (données structurées)
 
 Usage:
-    python capture_state.py                       (état et équipement demandés)
+    python capture_state.py -f hosts.txt
+    python capture_state.py -f hosts.txt --phase before -u admin
     python capture_state.py --host 10.0.0.1 --label bigip-a
-    python capture_state.py -f equipements.txt --phase after
+    python capture_state.py                      (tout en interactif)
 
-Si --phase n'est pas fourni, l'état (before / after) est demandé au lancement.
+Fichier d'équipements (-f), une ligne par équipement, # = commentaire :
+    10.0.0.1                         (IP seule : le label = l'IP)
+    bigip-a;10.0.0.1                 (label;host)
+    bigip-a;10.0.0.1;admin           (label;host;user)
+    bigip-a;10.0.0.1;admin;2222      (label;host;user;port)
 
-Format du fichier -f (une ligne par équipement, # = commentaire) :
-    label;host;utilisateur[;port]
-
-Le mot de passe est demandé une fois (ou variable d'environnement BIGIP_PASSWORD).
+Les lignes sans user utilisent l'utilisateur global (-u ou saisi).
+Si --phase est absent, l'état (before / after) est demandé.
+Le mot de passe est demandé une fois (ou variable BIGIP_PASSWORD).
 
 Dépendance : paramiko  (pip install paramiko)
 """
@@ -34,13 +38,14 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import paramiko
 
 REPERTOIRE_CAPTURES = "captures"
 TIMEOUT_SSH = 30
 TIMEOUT_COMMANDE = 120
+PORT_DEFAUT = 22
 
 # /*/* = toutes les partitions (sans cela, seule /Common est retournée)
 COMMANDES_TMSH = [
@@ -48,6 +53,9 @@ COMMANDES_TMSH = [
     ("state_pool.txt",    "show ltm pool /*/* members field-fmt"),
     ("state_node.txt",    "show ltm node /*/* field-fmt"),
 ]
+
+# (label, host, user ou None, port)
+Equipement = Tuple[str, str, Optional[str], int]
 
 
 # ------------------------------------------------------- Saisie interactive
@@ -66,17 +74,67 @@ def demander_phase() -> str:
         print("Réponse invalide, tape 1, 2, before ou after.")
 
 
-def demander_equipement():
-    """Demande label / host / user / port pour un équipement unique."""
+def demander_equipement_unique() -> List[Equipement]:
+    """Demande un équipement à la main (aucun fichier ni argument fourni)."""
     label = input("Nom de l'équipement (label) : ").strip()
     host = input("Adresse IP ou nom d'hôte : ").strip()
-    user = input("Utilisateur [admin] : ").strip() or "admin"
-    port_saisi = input("Port SSH [22] : ").strip()
-    port = int(port_saisi) if port_saisi else 22
-    if not label or not host:
-        print("Le label et l'hôte sont obligatoires.")
+    if not host:
+        print("L'hôte est obligatoire.")
         sys.exit(2)
-    return [(label, host, user, port)]
+    port_saisi = input("Port SSH [{}] : ".format(PORT_DEFAUT)).strip()
+    port = int(port_saisi) if port_saisi else PORT_DEFAUT
+    return [(label or host, host, None, port)]
+
+
+# ------------------------------------------------------- Fichier d'hôtes
+
+def lire_fichier_hosts(chemin: str) -> List[Equipement]:
+    """Lit le fichier d'équipements.
+
+    Formats acceptés (séparateur ';') :
+        host
+        label;host
+        label;host;user
+        label;host;user;port
+    Les lignes vides et les commentaires (#) sont ignorés. Les doublons
+    (même host + port) sont supprimés."""
+    fichier = Path(chemin)
+    if not fichier.is_file():
+        print("Fichier introuvable : {}".format(chemin))
+        sys.exit(2)
+
+    equipements: List[Equipement] = []
+    vus = set()
+    for numero, ligne in enumerate(fichier.read_text(encoding="utf-8").splitlines(), 1):
+        ligne = ligne.split("#", 1)[0].strip()
+        if not ligne:
+            continue
+        champs = [c.strip() for c in ligne.split(";")]
+
+        if len(champs) == 1:
+            label, host, user, port_txt = champs[0], champs[0], "", ""
+        elif len(champs) == 2:
+            label, host, user, port_txt = champs[0], champs[1], "", ""
+        else:
+            label, host, user = champs[0], champs[1], champs[2]
+            port_txt = champs[3] if len(champs) > 3 else ""
+
+        if not host:
+            print("Ligne {} ignorée (hôte vide) : {}".format(numero, ligne))
+            continue
+        try:
+            port = int(port_txt) if port_txt else PORT_DEFAUT
+        except ValueError:
+            print("Ligne {} ignorée (port invalide) : {}".format(numero, ligne))
+            continue
+
+        cle = (host, port)
+        if cle in vus:
+            print("Ligne {} ignorée (doublon) : {}".format(numero, host))
+            continue
+        vus.add(cle)
+        equipements.append((label or host, host, user or None, port))
+    return equipements
 
 
 # ---------------------------------------------------------------- SSH
@@ -105,8 +163,8 @@ def connecter(host: str, port: int, user: str, password: str) -> paramiko.SSHCli
 
 def decouper_blocs(texte: str, prefixe: str) -> List[List[str]]:
     """Découpe une sortie 'field-fmt' en blocs, un par objet.
-    Un bloc commence par une ligne '<prefixe> <nom>' (ex. 'ltm virtual /Common/vs')
-    et se termine par '}' au niveau 0. Gère les sous-blocs imbriqués."""
+    Un bloc commence par '<prefixe> <nom> {' et se termine par '}' au
+    niveau 0. Gère les sous-blocs imbriqués."""
     blocs, courant, profondeur = [], None, 0
     for ligne in texte.splitlines():
         brut = ligne.strip()
@@ -207,7 +265,8 @@ def parser_pools(texte: str):
 def capturer_equipement(label: str, host: str, port: int, user: str,
                         password: str, phase: str, racine: Path) -> Path:
     horodatage = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dossier = racine / "{}_{}_{}".format(label, phase, horodatage)
+    nom_sain = re.sub(r"[^\w.\-]", "_", label)
+    dossier = racine / "{}_{}_{}".format(nom_sain, phase, horodatage)
     dossier.mkdir(parents=True, exist_ok=True)
 
     client = connecter(host, port, user, password)
@@ -240,8 +299,6 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
 
     print("  Résumé : {} virtual(s), {} pool(s), {} membre(s), {} node(s)".format(
         len(virtuals), len(pools), len(membres), len(nodes)))
-
-    # Contrôle : combien d'objets hors /Common ?
     hors_common = sum(1 for n in virtuals if not n.startswith("/Common/"))
     print("  Dont {} virtual(s) hors /Common".format(hors_common))
     return dossier
@@ -249,64 +306,63 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
 
 # ------------------------------------------------------------- Entrée
 
-def lire_fichier_equipements(chemin: str):
-    equipements = []
-    for numero, ligne in enumerate(Path(chemin).read_text(encoding="utf-8").splitlines(), 1):
-        ligne = ligne.strip()
-        if not ligne or ligne.startswith("#"):
-            continue
-        champs = [c.strip() for c in ligne.split(";")]
-        if len(champs) < 3:
-            print("Ligne {} ignorée (format label;host;user[;port]) : {}".format(numero, ligne))
-            continue
-        port = int(champs[3]) if len(champs) > 3 and champs[3] else 22
-        equipements.append((champs[0], champs[1], champs[2], port))
-    return equipements
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Capture de l'état runtime BIG-IP.")
+    parser = argparse.ArgumentParser(
+        description="Capture de l'état runtime BIG-IP (multi-équipements).")
+    parser.add_argument("-f", "--fichier",
+                        help="fichier d'équipements (label;host[;user[;port]])")
     parser.add_argument("--phase", choices=["before", "after"],
                         help="état de la capture (demandé si absent)")
-    parser.add_argument("--host")
-    parser.add_argument("--label")
-    parser.add_argument("--user", default="admin")
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("-f", "--fichier", help="fichier d'équipements (label;host;user[;port])")
+    parser.add_argument("-u", "--user",
+                        help="utilisateur par défaut (demandé si absent)")
+    parser.add_argument("--host", help="équipement unique (sans fichier)")
+    parser.add_argument("--label", help="label de l'équipement unique")
+    parser.add_argument("--port", type=int, default=PORT_DEFAUT)
     parser.add_argument("--captures", default=REPERTOIRE_CAPTURES)
     args = parser.parse_args()
 
-    # 1) État before / after : demandé si non fourni
+    # 1) État before / after
     phase = args.phase or demander_phase()
 
     # 2) Équipements : fichier, arguments, ou saisie interactive
     if args.fichier:
-        equipements = lire_fichier_equipements(args.fichier)
-    elif args.host and args.label:
-        equipements = [(args.label, args.host, args.user, args.port)]
+        equipements = lire_fichier_hosts(args.fichier)
+    elif args.host:
+        equipements = [(args.label or args.host, args.host, None, args.port)]
     else:
-        equipements = demander_equipement()
+        equipements = demander_equipement_unique()
 
     if not equipements:
         print("Aucun équipement à traiter.")
         return 2
 
+    # 3) Identifiants : utilisateur par défaut + mot de passe unique
+    user_defaut = args.user or input("Utilisateur par défaut [admin] : ").strip() or "admin"
+    password = os.environ.get("BIGIP_PASSWORD") or getpass.getpass("Mot de passe : ")
+
     print("\nPhase : {} | {} équipement(s)".format(phase.upper(), len(equipements)))
 
-    password = os.environ.get("BIGIP_PASSWORD") or getpass.getpass("Mot de passe : ")
     racine = Path(args.captures)
     racine.mkdir(parents=True, exist_ok=True)
 
-    erreurs = 0
+    ok, erreurs = 0, []
     for label, host, user, port in equipements:
-        print("=== {} ({}) - phase {} ===".format(label, host, phase))
+        utilisateur = user or user_defaut
+        print("\n=== {} ({}:{}) - {} - phase {} ===".format(
+            label, host, port, utilisateur, phase))
         try:
-            dossier = capturer_equipement(label, host, port, user, password,
-                                          phase, racine)
+            dossier = capturer_equipement(label, host, port, utilisateur,
+                                          password, phase, racine)
             print("  -> {}".format(dossier))
+            ok += 1
         except Exception as exc:  # noqa: BLE001
-            erreurs += 1
+            erreurs.append((label, str(exc)))
             print("  [ERREUR] {}".format(exc))
+
+    # 4) Bilan
+    print("\n==== Bilan : {} OK, {} en erreur ====".format(ok, len(erreurs)))
+    for label, message in erreurs:
+        print("  - {} : {}".format(label, message))
 
     return 1 if erreurs else 0
 
