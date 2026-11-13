@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Capture en lecture seule de la configuration BIG-IP via SSH.
+"""Récupération en lecture seule des fichiers de configuration BIG-IP via SSH.
+
+Fichiers récupérés :
+    /config/bigip.conf
+    /config/bigip_base.conf
+    /config/partitions/<partition>/bigip.conf   (une par partition)
 
 Usage:
-    python capture.py --host 10.0.0.11 --label bigip-a [--phase before|after]
-    python capture.py -f equipements.txt [--phase before|after] [--shell tmsh]
+    python capture_conf.py --host 10.0.0.11 --label bigip-a [--phase before|after]
+    python capture_conf.py -f equipements.txt [--phase before|after] [--shell tmsh]
 
 Format du fichier d'équipements (une ligne par équipement) :
     hote[:port][;label]
@@ -13,6 +18,7 @@ Les lignes vides et celles commençant par # sont ignorées.
 
 import argparse
 import getpass
+import hashlib
 import json
 import re
 import shlex
@@ -21,110 +27,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Liste des commandes conservée dans sa forme tmsh d'origine.
-COMMANDS: List[Tuple[str, str]] = [
-    ("version", "tmsh show sys version"),
-    ("hardware", "tmsh show sys hardware"),
-    ("license", "tmsh show sys license"),
-    ("provision", "tmsh list sys provision"),
-    ("disk", "tmsh show sys disk directory; echo; echo '--- df -h ---'; df -h; echo; echo '--- raid ---'; tmsh show sys raid"),
-    ("software", "tmsh show sys software"),
-    ("ucs_list", "tmsh list sys ucs"),
-    ("ntp", "tmsh list sys ntp"),
-    ("dns", "tmsh list sys dns"),
-    ("snmp", "tmsh list sys snmp"),
-    ("syslog", "tmsh list sys syslog"),
-    ("ha_status", "tmsh show cm sync-status"),
-    ("failover", "tmsh show sys failover"),
-    ("device", "tmsh list cm device"),
-    ("vlan", "tmsh list net vlan"),
-    ("self_ip", "tmsh list net self"),
-    ("route", "tmsh list net route"),
-    ("trunk", "tmsh list net trunk"),
-    ("ltm_virtual", "tmsh list ltm virtual all-properties"),
-    ("ltm_virtual_stats", "tmsh show ltm virtual"),
-    ("ltm_pool", "tmsh list ltm pool all-properties"),
-    ("ltm_pool_stats", "tmsh show ltm pool"),
-    ("ltm_node", "tmsh list ltm node all-properties"),
+CONFIG_DIR = "/config"
+FICHIERS_FIXES: List[Tuple[str, str, str]] = [
+    # (identifiant, chemin distant, nom local)
+    ("bigip_conf", CONFIG_DIR + "/bigip.conf", "bigip.conf"),
+    ("bigip_base_conf", CONFIG_DIR + "/bigip_base.conf", "bigip_base.conf"),
 ]
-
-for _monitor in ("tcp", "http", "https", "icmp", "gateway-icmp", "udp", "tcp-half-open", "external", "dns", "ldap", "mysql", "radius", "sip", "smtp"):
-    _name = "ltm_monitor_" + _monitor.replace("-", "_")
-    COMMANDS.append((_name, "tmsh list ltm monitor " + _monitor))
-
-for _profile, _name in (
-    ("client-ssl", "ltm_profile_client_ssl"),
-    ("server-ssl", "ltm_profile_server_ssl"),
-    ("http", "ltm_profile_http"),
-    ("tcp", "ltm_profile_tcp"),
-    ("udp", "ltm_profile_udp"),
-    ("fastl4", "ltm_profile_fastl4"),
-    ("one-connect", "ltm_profile_oneconnect"),
-    ("http-compression", "ltm_profile_http_compression"),
-    ("web-acceleration", "ltm_profile_web_acceleration"),
-    ("stream", "ltm_profile_stream"),
-):
-    COMMANDS.append((_name, "tmsh list ltm profile " + _profile))
-
-for _persistence, _name in (
-    ("cookie", "ltm_persistence_cookie"),
-    ("source-addr", "ltm_persistence_source_addr"),
-    ("ssl", "ltm_persistence_ssl"),
-    ("universal", "ltm_persistence_universal"),
-):
-    COMMANDS.append((_name, "tmsh list ltm persistence " + _persistence))
-
-COMMANDS.extend([
-    ("certs", "tmsh list sys file ssl-cert"),
-    ("keys", "tmsh list sys file ssl-key"),
-    ("ltm_rule", "tmsh list ltm rule"),
-])
-
-FILTER_SYS_RULES = re.compile(r"(?m)^\s*ltm rule\s+(?:/Common/)?_sys_[^\s{]+\s*\{")
-
-
-def filter_sys_rules(text: str) -> str:
-    """Retire les blocs de règles _sys_ en comptant les accolades imbriquées."""
-    lines = text.splitlines(keepends=True)
-    output: List[str] = []
-    skipping = False
-    depth = 0
-    for line in lines:
-        if not skipping:
-            match = FILTER_SYS_RULES.search(line)
-            if not match:
-                output.append(line)
-                continue
-            skipping = True
-            depth = 0
-        # Le comptage est volontairement simple et suit la structure tmsh.
-        depth += line.count("{") - line.count("}")
-        if depth <= 0:
-            skipping = False
-            depth = 0
-    return "".join(output)
-
-
-def adapter_commande(cmd: str, shell: str) -> str:
-    """Adapte la commande selon le shell SSH distant détecté."""
-    if shell == "bash":
-        return cmd
-    if shell != "tmsh":
-        raise ValueError("shell non pris en charge : {}".format(shell))
-
-    # En tmsh, les commandes composées sont déléguées à bash via run /util.
-    # Cela évite les interprétations tmsh des points-virgules, echo et df.
-    lower = cmd.lower()
-    if ";" in cmd or re.search(r"(?:^|\s)(?:df|echo)(?:\s|$)", lower):
-        if cmd.startswith("tmsh "):
-            wrapped = cmd
-        else:
-            wrapped = "tmsh " + cmd
-        return "run /util bash -c {}".format(shlex.quote(wrapped))
-
-    if cmd.startswith("tmsh "):
-        return cmd[len("tmsh "):]
-    return cmd
+# Nom de partition valide : lettres, chiffres, tiret, underscore, point.
+PARTITION_VALIDE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _sortie(chaine: Any) -> str:
@@ -142,6 +52,26 @@ def run(client: Any, cmd: str, timeout: int = 180) -> Tuple[str, str, int]:
     err = _sortie(stderr)
     rc = stdout.channel.recv_exit_status()
     return out, err, rc
+
+
+def run_brut(client: Any, cmd: str, timeout: int = 180) -> Tuple[bytes, str, int]:
+    """Comme run(), mais conserve stdout en octets bruts (pas de décodage)."""
+    _stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+    out = stdout.read()
+    if not isinstance(out, bytes):
+        out = str(out).encode("utf-8")
+    err = _sortie(stderr)
+    rc = stdout.channel.recv_exit_status()
+    return out, err, rc
+
+
+def adapter_commande_bash(cmd_bash: str, shell: str) -> str:
+    """Enveloppe une commande bash selon le shell de connexion distant."""
+    if shell == "bash":
+        return cmd_bash
+    if shell == "tmsh":
+        return "run /util bash -c {}".format(shlex.quote(cmd_bash))
+    raise ValueError("shell non pris en charge : {}".format(shell))
 
 
 def _methodes_autorisees(erreurs: List[BaseException]) -> List[str]:
@@ -187,7 +117,6 @@ def ouvrir_client(host: str, port: int, user: str, password: str, timeout: int =
                 def handler(_titre: str, _instructions: str, prompts: List[Tuple[str, bool]]) -> List[str]:
                     return [password for _prompt, _echo in prompts]
                 try:
-                    # auth_interactive effectue le dispatch Paramiko vers le serveur.
                     transport.auth_interactive(user, handler)
                 except (paramiko.BadAuthenticationType, paramiko.AuthenticationException) as exc:
                     erreurs.append(exc)
@@ -211,7 +140,6 @@ def _detecter_shell(client: Any, timeout: int = 30) -> str:
       commande est introuvable (code retour 127).
     - Sonde bash : 'echo $((6*7))' vaut 42 en bash ; en tmsh, c'est une erreur.
     """
-    # 1) Sonde tmsh : sortie typique de "show sys version" et code retour 0.
     try:
         out, _err, rc = run(client, "show sys version", timeout=timeout)
         if rc == 0 and re.search(r"Sys::Version|Product\s+BIG-IP", out):
@@ -219,7 +147,6 @@ def _detecter_shell(client: Any, timeout: int = 30) -> str:
     except Exception:
         pass
 
-    # 2) Sonde bash : l'arithmétique shell renvoie exactement 42.
     try:
         out, _err, rc = run(client, "echo $((6*7))", timeout=timeout)
         if rc == 0 and out.strip() == "42":
@@ -235,9 +162,67 @@ def _nettoyer_secret(texte: str, secret: str) -> str:
     return texte.replace(secret, "[MASQUÉ]") if secret else texte
 
 
-def _nom_fichier(name: str) -> str:
-    """Les identifiants de commandes sont des noms de fichier sûrs et stables."""
-    return name + ".txt"
+def lister_partitions(client: Any, shell: str) -> List[str]:
+    """Liste les partitions ayant un bigip.conf dédié (hors Common)."""
+    cmd = adapter_commande_bash(
+        "ls -1 {}/partitions 2>/dev/null".format(CONFIG_DIR), shell)
+    out, _err, rc = run(client, cmd, timeout=60)
+    partitions: List[str] = []
+    for ligne in out.splitlines():
+        nom = ligne.strip()
+        if not nom:
+            continue
+        if not PARTITION_VALIDE.match(nom):
+            print("[ATTENTION] Partition ignorée (nom inattendu) : {!r}".format(nom),
+                  file=sys.stderr)
+            continue
+        partitions.append(nom)
+    return partitions
+
+
+def recuperer_fichier(client: Any, shell: str, chemin_distant: str,
+                      chemin_local: Path, password: str) -> Dict[str, Any]:
+    """Lit un fichier distant par cat, vérifie la taille et écrit en local."""
+    # shlex.quote protège le chemin ; les noms de partition sont déjà validés.
+    cmd_cat = adapter_commande_bash("cat {}".format(shlex.quote(chemin_distant)), shell)
+    cmd_wc = adapter_commande_bash("wc -c < {}".format(shlex.quote(chemin_distant)), shell)
+
+    try:
+        contenu, err, rc = run_brut(client, cmd_cat, timeout=180)
+    except Exception as exc:
+        return {"status": "ERREUR", "bytes": 0,
+                "error": _nettoyer_secret(str(exc), password)}
+
+    if rc != 0:
+        message = _nettoyer_secret(err.strip() or "code retour {}".format(rc), password)
+        return {"status": "ERREUR", "bytes": 0, "return_code": rc, "error": message}
+    if not contenu.strip():
+        return {"status": "VIDE", "bytes": 0, "return_code": rc}
+
+    # Contrôle d'intégrité : taille annoncée par le BIG-IP = octets reçus.
+    taille_distante: Optional[int] = None
+    try:
+        out_wc, _e, rc_wc = run(client, cmd_wc, timeout=60)
+        if rc_wc == 0 and out_wc.strip().isdigit():
+            taille_distante = int(out_wc.strip())
+    except Exception:
+        pass
+
+    chemin_local.write_bytes(contenu)
+    resultat: Dict[str, Any] = {
+        "status": "OK",
+        "bytes": len(contenu),
+        "return_code": rc,
+        "sha256": hashlib.sha256(contenu).hexdigest(),
+        "remote_path": chemin_distant,
+    }
+    if taille_distante is not None:
+        resultat["remote_bytes"] = taille_distante
+        if taille_distante != len(contenu):
+            resultat["status"] = "ERREUR"
+            resultat["error"] = "taille différente : {} reçus, {} attendus".format(
+                len(contenu), taille_distante)
+    return resultat
 
 
 def _resume(results: Dict[str, Dict[str, Any]]) -> None:
@@ -245,7 +230,7 @@ def _resume(results: Dict[str, Dict[str, Any]]) -> None:
     for name, result in results.items():
         status = result.get("status", "ERREUR")
         n = result.get("bytes", 0)
-        print("[{:6}] {:32} ({} octets)".format(status, name, n))
+        print("[{:6}] {:40} ({} octets)".format(status, name, n))
 
 
 def lire_fichier_equipements(path: Path) -> List[Tuple[str, int, str]]:
@@ -286,7 +271,7 @@ def demander_phase() -> str:
 def capturer_equipement(host: str, port: int, label: str, phase: str,
                         user: str, password: str, outdir: str,
                         shell_force: str = "auto") -> bool:
-    """Capture un équipement. Renvoie True si la capture a pu être réalisée."""
+    """Récupère les fichiers de configuration. True si tout a été récupéré."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     capture_dir = Path(outdir) / "{}_{}_{}".format(label, phase, timestamp)
     capture_dir.mkdir(parents=True, exist_ok=True)
@@ -309,28 +294,32 @@ def capturer_equipement(host: str, port: int, label: str, phase: str,
                     _nettoyer_secret(str(exc), password)), file=sys.stderr)
                 return False
         print("[*] Shell détecté : {}".format(shell))
-        results: Dict[str, Dict[str, Any]] = {}
 
-        for name, cmd in COMMANDS:
-            try:
-                remote_cmd = adapter_commande(cmd, shell)
-                out, err, rc = run(client, remote_cmd, timeout=180)
-                out = _nettoyer_secret(out, password)
-                err = _nettoyer_secret(err, password)
-                if name == "ltm_rule":
-                    out = filter_sys_rules(out)
-                content = out
-                if err.strip():
-                    content += "\n### STDERR ###\n" + err
-                (capture_dir / _nom_fichier(name)).write_text(content, encoding="utf-8")
-                status = "ERREUR" if rc else ("OK" if out.strip() else "VIDE")
-                results[name] = {"status": status, "bytes": len(out.encode("utf-8")), "return_code": rc}
-            except Exception as exc:
-                message = _nettoyer_secret(str(exc), password)
-                (capture_dir / _nom_fichier(name)).write_text("\n### STDERR ###\n" + message, encoding="utf-8")
-                results[name] = {"status": "ERREUR", "bytes": 0, "error": message}
-            print("[{:6}] {:32} ({} octets)".format(
-                results[name]["status"], name, results[name]["bytes"]))
+        # Liste des fichiers : fixes + un bigip.conf par partition.
+        fichiers: List[Tuple[str, str, str]] = list(FICHIERS_FIXES)
+        try:
+            partitions = lister_partitions(client, shell)
+        except Exception as exc:
+            print("[ATTENTION] Liste des partitions impossible : {}".format(
+                _nettoyer_secret(str(exc), password)), file=sys.stderr)
+            partitions = []
+        for partition in partitions:
+            fichiers.append((
+                "partition_{}_bigip_conf".format(partition),
+                "{}/partitions/{}/bigip.conf".format(CONFIG_DIR, partition),
+                "partition_{}_bigip.conf".format(partition),
+            ))
+        print("[*] Partitions détectées : {}".format(", ".join(partitions) or "aucune (Common seule)"))
+
+        results: Dict[str, Dict[str, Any]] = {}
+        for identifiant, chemin_distant, nom_local in fichiers:
+            res = recuperer_fichier(client, shell, chemin_distant,
+                                    capture_dir / nom_local, password)
+            res["local_file"] = nom_local
+            results[identifiant] = res
+            print("[{:6}] {:40} ({} octets)".format(res["status"], nom_local, res["bytes"]))
+            if res.get("error"):
+                print("         -> {}".format(res["error"]), file=sys.stderr)
 
         metadata = {
             "host": host,
@@ -339,13 +328,14 @@ def capturer_equipement(host: str, port: int, label: str, phase: str,
             "phase": phase,
             "timestamp": timestamp,
             "shell": shell,
+            "partitions": partitions,
             "results": results,
         }
         (capture_dir / "_meta.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         _resume(results)
         print("\nCapture enregistrée dans : {}".format(capture_dir))
-        return True
+        return all(r["status"] == "OK" for r in results.values())
     finally:
         try:
             client.close()
@@ -354,7 +344,8 @@ def capturer_equipement(host: str, port: int, label: str, phase: str,
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Capture de configuration BIG-IP par SSH.")
+    parser = argparse.ArgumentParser(
+        description="Récupération des fichiers de configuration BIG-IP par SSH.")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--host", help="Nom ou adresse IP d'un BIG-IP")
     source.add_argument("-f", "--hosts-file", dest="hosts_file",
@@ -397,7 +388,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             ok = capturer_equipement(host, port, label, phase, user, password,
                                      args.outdir, args.shell)
         except Exception as exc:
-            print("[ERREUR] {} : {}".format(label, _nettoyer_secret(str(exc), password)), file=sys.stderr)
+            print("[ERREUR] {} : {}".format(label, _nettoyer_secret(str(exc), password)),
+                  file=sys.stderr)
             ok = False
         bilan.append((label, ok))
 
