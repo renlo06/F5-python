@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Relevé en lecture seule de l'état runtime BIG-IP : virtual servers, pools,
-membres, nodes. Les pools sont relevés sur TOUTES les partitions.
+membres, nodes. Les pools sont relevés sur TOUTES les partitions via /*/*.
 
 Fichiers produits (captures/<label>_<phase>_<horodatage>/) :
     state_virtual.txt      show ltm virtual field-fmt
-    state_pool.txt         show ltm pool members field-fmt (toutes partitions)
+    state_pool.txt         show ltm pool /*/* members field-fmt
     state_node.txt         show ltm node field-fmt
     state_summary.json     synthèse parsée
     _meta_state.json       métadonnées (shell, durées, tailles, SHA256)
@@ -47,13 +47,11 @@ TIMEOUT_CONNEXION = 15      # secondes
 TIMEOUT_COMMANDE = 180      # secondes
 REPERTOIRE_SORTIE = "captures"
 
-PREFIXE_PARTITIONS = "modify cli admin-partitions update-partition All"
-
-# (fichier de sortie, commande tmsh, toutes_partitions)
+# (fichier de sortie, commande tmsh)
 COMMANDES_TMSH = [
-    ("state_virtual.txt", "show ltm virtual field-fmt", False),
-    ("state_pool.txt", "show ltm pool members field-fmt", True),
-    ("state_node.txt", "show ltm node field-fmt", False),
+    ("state_virtual.txt", "show ltm virtual field-fmt"),
+    ("state_pool.txt", "show ltm pool /*/* members field-fmt"),
+    ("state_node.txt", "show ltm node field-fmt"),
 ]
 
 
@@ -67,22 +65,23 @@ def sha256_texte(texte: str) -> str:
 
 def demander_phase() -> str:
     while True:
-        rep = input("Phase de la capture (before/after) : ").strip().lower()
+        rep = input("Phase de la capture [before/after] : ").strip().lower()
         if rep in ("before", "after"):
             return rep
-        print("Réponse invalide : saisir 'before' ou 'after'.")
+        print("  Réponse invalide, tapez 'before' ou 'after'.")
 
 
 def lire_fichier_equipements(chemin: str) -> List[Tuple[str, str]]:
-    equipements = []
+    """Lit 'ip [label]' par ligne ; '#' = commentaire."""
+    equipements: List[Tuple[str, str]] = []
     with open(chemin, "r", encoding="utf-8") as f:
         for ligne in f:
-            ligne = ligne.strip()
-            if not ligne or ligne.startswith("#"):
+            ligne = ligne.split("#", 1)[0].strip()
+            if not ligne:
                 continue
-            parts = ligne.split()
-            hote = parts[0]
-            label = parts[1] if len(parts) > 1 else hote
+            parties = ligne.split()
+            hote = parties[0]
+            label = parties[1] if len(parties) > 1 else hote
             equipements.append((hote, label))
     return equipements
 
@@ -91,9 +90,8 @@ def lire_fichier_equipements(chemin: str) -> List[Tuple[str, str]]:
 # SSH
 # --------------------------------------------------------------------------- #
 
-def connecter(hote: str, port: int, utilisateur: str, mot_de_passe: str) -> paramiko.SSHClient:
+def ouvrir_connexion(hote: str, port: int, utilisateur: str, mot_de_passe: str) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
-    # Pas de vérification de clé d'hôte
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
         hostname=hote,
@@ -109,111 +107,111 @@ def connecter(hote: str, port: int, utilisateur: str, mot_de_passe: str) -> para
     return client
 
 
-def executer(client: paramiko.SSHClient, commande: str, timeout: int = TIMEOUT_COMMANDE) -> Tuple[str, str, int]:
+def executer(client: paramiko.SSHClient, commande: str, timeout: int = TIMEOUT_COMMANDE) -> Tuple[int, str, str]:
     _stdin, stdout, stderr = client.exec_command(commande, timeout=timeout)
     sortie = stdout.read().decode("utf-8", errors="replace")
     erreur = stderr.read().decode("utf-8", errors="replace")
     code = stdout.channel.recv_exit_status()
-    return sortie, erreur, code
+    return code, sortie, erreur
 
 
 def detecter_shell(client: paramiko.SSHClient) -> str:
-    """Retourne 'bash' si la session atterrit dans bash, 'tmsh' si elle atterrit dans tmsh."""
-    sortie, _err, code = executer(client, "echo $0", timeout=TIMEOUT_CONNEXION)
-    sortie = sortie.strip().lower()
-    if code == 0 and ("bash" in sortie or sortie.endswith("sh")):
-        return "bash"
-    return "tmsh"
+    """Retourne 'tmsh' si le shell de connexion est tmsh, sinon 'bash'."""
+    code, sortie, _err = executer(client, "show sys version", timeout=30)
+    if code == 0 and "Sys::Version" in sortie:
+        return "tmsh"
+    return "bash"
 
 
-def construire_commande(shell: str, cmd_tmsh: str, toutes_partitions: bool = False) -> str:
-    """Adapte la commande au shell ; active la vue sur toutes les partitions si demandé."""
-    complete = "{}; {}".format(PREFIXE_PARTITIONS, cmd_tmsh) if toutes_partitions else cmd_tmsh
+def construire_commande(shell: str, cmd_tmsh: str) -> str:
+    """Adapte la commande au shell de connexion (guillemets simples : '*' protégé)."""
     if shell == "bash":
-        return 'tmsh -c "{}"'.format(complete)
-    return complete
+        return "tmsh -c '{}'".format(cmd_tmsh)
+    return cmd_tmsh
 
 
 # --------------------------------------------------------------------------- #
-# Parsing field-fmt
+# Parsing
 # --------------------------------------------------------------------------- #
 
-def decouper_blocs(texte: str, prefixe: str) -> List[List[str]]:
-    """Découpe la sortie field-fmt en blocs d'objets (un bloc par 'ltm <type> <nom> {')."""
-    blocs: List[List[str]] = []
-    courant: Optional[List[str]] = None
-    for ligne in texte.splitlines():
-        if ligne.startswith(prefixe) and ligne.rstrip().endswith("{"):
-            courant = [ligne]
-            blocs.append(courant)
-        elif courant is not None:
-            courant.append(ligne)
+def _extraire_valeur(bloc: str, champ: str) -> Optional[str]:
+    m = re.search(r"^\s*{}\s+(\S+)".format(re.escape(champ)), bloc, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _decouper_blocs(texte: str, prefixe: str) -> List[Tuple[str, str]]:
+    """Découpe 'prefixe <nom> {' ... '}' de premier niveau en (nom, contenu)."""
+    blocs: List[Tuple[str, str]] = []
+    motif = re.compile(r"^{}\s+(\S+)\s*\{{".format(re.escape(prefixe)), re.MULTILINE)
+    for m in motif.finditer(texte):
+        nom = m.group(1)
+        debut = m.end()
+        profondeur = 1
+        i = debut
+        while i < len(texte) and profondeur > 0:
+            if texte[i] == "{":
+                profondeur += 1
+            elif texte[i] == "}":
+                profondeur -= 1
+            i += 1
+        blocs.append((nom, texte[debut:i - 1]))
     return blocs
-
-
-def extraire_champ(bloc: List[str], champ: str) -> Optional[str]:
-    motif = re.compile(r"^\s*{}\s+(.+?)\s*$".format(re.escape(champ)))
-    for ligne in bloc:
-        m = motif.match(ligne)
-        if m:
-            return m.group(1)
-    return None
 
 
 def parser_virtuals(texte: str) -> List[Dict[str, Optional[str]]]:
     resultat = []
-    for bloc in decouper_blocs(texte, "ltm virtual "):
-        nom = bloc[0].split()[2]
+    for nom, bloc in _decouper_blocs(texte, "ltm virtual"):
         resultat.append({
             "nom": nom,
-            "destination": extraire_champ(bloc, "destination"),
-            "etat": extraire_champ(bloc, "status.availability-state"),
-            "etat_active": extraire_champ(bloc, "status.enabled-state"),
+            "destination": _extraire_valeur(bloc, "destination"),
+            "disponibilite": _extraire_valeur(bloc, "status.availability-state"),
+            "etat": _extraire_valeur(bloc, "status.enabled-state"),
+            "raison": _extraire_valeur(bloc, "status.status-reason"),
         })
     return resultat
 
 
 def parser_pools(texte: str) -> List[Dict[str, object]]:
-    """Parse 'show ltm pool members field-fmt' : un bloc pool contenant des blocs de membres."""
-    pools: List[Dict[str, object]] = []
-    pool_courant: Optional[Dict[str, object]] = None
-    membre_courant: Optional[Dict[str, Optional[str]]] = None
-
-    for ligne in texte.splitlines():
-        brut = ligne.strip()
-        if ligne.startswith("ltm pool ") and brut.endswith("{"):
-            pool_courant = {
-                "nom": ligne.split()[2],
-                "etat": None,
-                "etat_active": None,
-                "membres": [],
-            }
-            pools.append(pool_courant)
-            membre_courant = None
-        elif pool_courant is None:
-            continue
-        elif brut.startswith("members {"):
-            continue
-        elif re.match(r"^\S+:\d+\s*\{$", brut) or re.match(r"^\S+\.\d+\s*\{$", brut):
-            adresse = brut[:-1].strip()
-            membre_courant = {"adresse": adresse, "etat": None, "etat_active": None}
-            pool_courant["membres"].append(membre_courant)  # type: ignore[union-attr]
-        elif brut.startswith("status.availability-state"):
-            valeur = brut.split(None, 1)[1]
-            (membre_courant if membre_courant is not None else pool_courant)["etat"] = valeur
-        elif brut.startswith("status.enabled-state"):
-            valeur = brut.split(None, 1)[1]
-            (membre_courant if membre_courant is not None else pool_courant)["etat_active"] = valeur
-    return pools
+    resultat = []
+    for nom, bloc in _decouper_blocs(texte, "ltm pool"):
+        membres = []
+        m = re.search(r"^\s*members\s*\{", bloc, re.MULTILINE)
+        if m:
+            debut = m.end()
+            profondeur = 1
+            i = debut
+            while i < len(bloc) and profondeur > 0:
+                if bloc[i] == "{":
+                    profondeur += 1
+                elif bloc[i] == "}":
+                    profondeur -= 1
+                i += 1
+            zone = bloc[debut:i - 1]
+            for adresse, contenu in re.findall(r"(\S+:\S+)\s*\{((?:[^{}]|\{[^{}]*\})*)\}", zone):
+                membres.append({
+                    "membre": adresse,
+                    "disponibilite": _extraire_valeur(contenu, "status.availability-state"),
+                    "etat": _extraire_valeur(contenu, "status.enabled-state"),
+                    "raison": _extraire_valeur(contenu, "status.status-reason"),
+                })
+        resultat.append({
+            "nom": nom,
+            "disponibilite": _extraire_valeur(bloc, "status.availability-state"),
+            "etat": _extraire_valeur(bloc, "status.enabled-state"),
+            "membres": membres,
+        })
+    return resultat
 
 
 def parser_nodes(texte: str) -> List[Dict[str, Optional[str]]]:
     resultat = []
-    for bloc in decouper_blocs(texte, "ltm node "):
+    for nom, bloc in _decouper_blocs(texte, "ltm node"):
         resultat.append({
-            "nom": bloc[0].split()[2],
-            "etat": extraire_champ(bloc, "status.availability-state"),
-            "etat_active": extraire_champ(bloc, "status.enabled-state"),
+            "nom": nom,
+            "adresse": _extraire_valeur(bloc, "addr"),
+            "disponibilite": _extraire_valeur(bloc, "status.availability-state"),
+            "etat": _extraire_valeur(bloc, "status.enabled-state"),
+            "raison": _extraire_valeur(bloc, "status.status-reason"),
         })
     return resultat
 
@@ -224,16 +222,18 @@ def parser_nodes(texte: str) -> List[Dict[str, Optional[str]]]:
 
 def capturer_equipement(hote: str, label: str, phase: str, utilisateur: str,
                         mot_de_passe: str, port: int, racine: Path) -> bool:
+    print("\n=== {} ({}) [{}] ===".format(label, hote, phase))
+    debut_global = time.time()
+
+    try:
+        client = ouvrir_connexion(hote, port, utilisateur, mot_de_passe)
+    except Exception as exc:
+        print("  [ERREUR] Connexion impossible : {}".format(exc))
+        return False
+
     horodatage = datetime.now().strftime("%Y%m%d_%H%M%S")
     dossier = racine / "{}_{}_{}".format(label, phase, horodatage)
     dossier.mkdir(parents=True, exist_ok=True)
-
-    print("\n[{}] Connexion à {} ...".format(label, hote))
-    try:
-        client = connecter(hote, port, utilisateur, mot_de_passe)
-    except Exception as exc:
-        print("[{}] ERREUR de connexion : {}".format(label, exc))
-        return False
 
     meta: Dict[str, object] = {
         "hote": hote,
@@ -242,64 +242,58 @@ def capturer_equipement(hote: str, label: str, phase: str, utilisateur: str,
         "horodatage": horodatage,
         "fichiers": {},
     }
-    succes = True
     contenus: Dict[str, str] = {}
+    succes = True
 
     try:
         shell = detecter_shell(client)
         meta["shell"] = shell
-        print("[{}] Shell détecté : {}".format(label, shell))
+        print("  Shell détecté : {}".format(shell))
 
-        for nom_fichier, cmd_tmsh, toutes_partitions in COMMANDES_TMSH:
-            commande = construire_commande(shell, cmd_tmsh, toutes_partitions)
-            debut = time.time()
+        for nom_fichier, cmd_tmsh in COMMANDES_TMSH:
+            commande = construire_commande(shell, cmd_tmsh)
+            t0 = time.time()
             try:
-                sortie, erreur, code = executer(client, commande)
+                code, sortie, erreur = executer(client, commande)
             except Exception as exc:
-                print("[{}] ERREUR sur '{}' : {}".format(label, cmd_tmsh, exc))
-                meta["fichiers"][nom_fichier] = {"erreur": str(exc)}  # type: ignore[index]
+                print("  [ERREUR] '{}' : {}".format(cmd_tmsh, exc))
                 succes = False
                 continue
-            duree = time.time() - debut
+            duree = round(time.time() - t0, 2)
 
-            if code != 0 or (erreur.strip() and not sortie.strip()):
-                print("[{}] ERREUR sur '{}' (code {}): {}".format(
-                    label, cmd_tmsh, code, erreur.strip() or sortie.strip()))
-                meta["fichiers"][nom_fichier] = {  # type: ignore[index]
-                    "commande": commande, "code": code, "erreur": erreur.strip()}
+            if code != 0:
+                print("  [ERREUR] '{}' (code {}) : {}".format(cmd_tmsh, code, (erreur or sortie).strip()))
                 succes = False
                 continue
 
             (dossier / nom_fichier).write_text(sortie, encoding="utf-8")
             contenus[nom_fichier] = sortie
-            meta["fichiers"][nom_fichier] = {  # type: ignore[index]
-                "commande": commande,
-                "duree_s": round(duree, 2),
-                "octets": len(sortie.encode("utf-8")),
+            meta["fichiers"][nom_fichier] = {
+                "commande": cmd_tmsh,
+                "octets": len(sortie.encode("utf-8", errors="replace")),
                 "sha256": sha256_texte(sortie),
+                "duree_s": duree,
             }
-            print("[{}] OK  {:<20} {:>8} octets  {:.1f}s".format(
-                label, nom_fichier, len(sortie.encode("utf-8")), duree))
-
-        synthese = {
-            "virtuals": parser_virtuals(contenus.get("state_virtual.txt", "")),
-            "pools": parser_pools(contenus.get("state_pool.txt", "")),
-            "nodes": parser_nodes(contenus.get("state_node.txt", "")),
-        }
-        (dossier / "state_summary.json").write_text(
-            json.dumps(synthese, indent=2, ensure_ascii=False), encoding="utf-8")
-        print("[{}] Synthèse : {} virtuals, {} pools, {} nodes".format(
-            label, len(synthese["virtuals"]), len(synthese["pools"]), len(synthese["nodes"])))
-
-    except Exception as exc:
-        print("[{}] ERREUR inattendue : {}".format(label, exc))
-        succes = False
+            print("  OK  {:<20} {:>8} octets  ({} s)".format(nom_fichier, len(sortie), duree))
     finally:
         client.close()
 
+    synthese = {
+        "virtuals": parser_virtuals(contenus.get("state_virtual.txt", "")),
+        "pools": parser_pools(contenus.get("state_pool.txt", "")),
+        "nodes": parser_nodes(contenus.get("state_node.txt", "")),
+    }
+    (dossier / "state_summary.json").write_text(
+        json.dumps(synthese, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    meta["duree_totale_s"] = round(time.time() - debut_global, 2)
+    meta["succes"] = succes
     (dossier / "_meta_state.json").write_text(
         json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-    print("[{}] Résultats dans : {}".format(label, dossier))
+
+    print("  Synthèse : {} virtuals, {} pools, {} nodes".format(
+        len(synthese["virtuals"]), len(synthese["pools"]), len(synthese["nodes"])))
+    print("  Dossier  : {}".format(dossier))
     return succes
 
 
@@ -308,8 +302,8 @@ def capturer_equipement(hote: str, label: str, phase: str, utilisateur: str,
 # --------------------------------------------------------------------------- #
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Relevé d'état BIG-IP (lecture seule)")
-    parser.add_argument("--host", help="Adresse IP / nom de l'équipement")
+    parser = argparse.ArgumentParser(description="Relevé d'état runtime BIG-IP (lecture seule)")
+    parser.add_argument("--host", help="Adresse IP ou nom de l'équipement")
     parser.add_argument("--label", help="Nom court utilisé pour nommer les fichiers")
     parser.add_argument("-f", "--file", help="Fichier listant les équipements")
     parser.add_argument("--phase", choices=["before", "after"], help="Phase de la capture")
