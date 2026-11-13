@@ -27,6 +27,9 @@ Les lignes sans user utilisent l'utilisateur global (-u ou saisi).
 Si --phase est absent, l'état (before / after) est demandé.
 Le mot de passe est demandé une fois (ou variable BIGIP_PASSWORD).
 
+Le shell de connexion (bash ou tmsh) est détecté automatiquement et les
+commandes sont adaptées en conséquence.
+
 Dépendance : paramiko  (pip install paramiko)
 """
 
@@ -66,286 +69,332 @@ def demander_phase() -> str:
     print("  1) before (avant l'intervention)")
     print("  2) after  (après l'intervention)")
     while True:
-        choix = input("Choix [1/2 ou before/after] : ").strip().lower()
-        if choix in ("1", "before", "b", "avant"):
+        reponse = input("Choix [1/2 ou before/after] : ").strip().lower()
+        if reponse in ("1", "b", "before", "avant"):
             return "before"
-        if choix in ("2", "after", "a", "apres", "après"):
+        if reponse in ("2", "a", "after", "apres", "après"):
             return "after"
-        print("Réponse invalide, tape 1, 2, before ou after.")
+        print("  Réponse invalide, tape 1 (before) ou 2 (after).")
 
 
-def demander_equipement_unique() -> List[Equipement]:
-    """Demande un équipement à la main (aucun fichier ni argument fourni)."""
-    label = input("Nom de l'équipement (label) : ").strip()
-    host = input("Adresse IP ou nom d'hôte : ").strip()
+def demander_equipement() -> Equipement:
+    """Demande interactivement un équipement unique."""
+    host = input("Adresse IP / nom d'hôte du BIG-IP : ").strip()
     if not host:
-        print("L'hôte est obligatoire.")
-        sys.exit(2)
-    port_saisi = input("Port SSH [{}] : ".format(PORT_DEFAUT)).strip()
-    port = int(port_saisi) if port_saisi else PORT_DEFAUT
-    return [(label or host, host, None, port)]
+        raise ValueError("Adresse vide.")
+    label = input("Label [{}] : ".format(host)).strip() or host
+    saisie_port = input("Port SSH [{}] : ".format(PORT_DEFAUT)).strip()
+    port = int(saisie_port) if saisie_port else PORT_DEFAUT
+    return label, host, None, port
 
 
-# ------------------------------------------------------- Fichier d'hôtes
+# --------------------------------------------------- Lecture du fichier hosts
 
 def lire_fichier_hosts(chemin: str) -> List[Equipement]:
     """Lit le fichier d'équipements.
 
-    Formats acceptés (séparateur ';') :
+    Formats acceptés par ligne :
         host
         label;host
         label;host;user
         label;host;user;port
-    Les lignes vides et les commentaires (#) sont ignorés. Les doublons
-    (même host + port) sont supprimés."""
-    fichier = Path(chemin)
-    if not fichier.is_file():
-        print("Fichier introuvable : {}".format(chemin))
-        sys.exit(2)
-
+    """
     equipements: List[Equipement] = []
     vus = set()
-    for numero, ligne in enumerate(fichier.read_text(encoding="utf-8").splitlines(), 1):
-        ligne = ligne.split("#", 1)[0].strip()
-        if not ligne:
-            continue
-        champs = [c.strip() for c in ligne.split(";")]
 
-        if len(champs) == 1:
-            label, host, user, port_txt = champs[0], champs[0], "", ""
-        elif len(champs) == 2:
-            label, host, user, port_txt = champs[0], champs[1], "", ""
-        else:
-            label, host, user = champs[0], champs[1], champs[2]
-            port_txt = champs[3] if len(champs) > 3 else ""
+    with open(chemin, "r", encoding="utf-8") as fichier:
+        for numero, ligne in enumerate(fichier, start=1):
+            ligne = ligne.split("#", 1)[0].strip()
+            if not ligne:
+                continue
 
-        if not host:
-            print("Ligne {} ignorée (hôte vide) : {}".format(numero, ligne))
-            continue
-        try:
-            port = int(port_txt) if port_txt else PORT_DEFAUT
-        except ValueError:
-            print("Ligne {} ignorée (port invalide) : {}".format(numero, ligne))
-            continue
+            champs = [c.strip() for c in ligne.split(";")]
+            user: Optional[str] = None
+            port = PORT_DEFAUT
 
-        cle = (host, port)
-        if cle in vus:
-            print("Ligne {} ignorée (doublon) : {}".format(numero, host))
-            continue
-        vus.add(cle)
-        equipements.append((label or host, host, user or None, port))
+            if len(champs) == 1:
+                host = champs[0]
+                label = host
+            else:
+                label, host = champs[0], champs[1]
+                if len(champs) >= 3 and champs[2]:
+                    user = champs[2]
+                if len(champs) >= 4 and champs[3]:
+                    try:
+                        port = int(champs[3])
+                    except ValueError:
+                        print("  [AVERTISSEMENT] ligne {} : port invalide '{}', "
+                              "ligne ignorée.".format(numero, champs[3]))
+                        continue
+
+            if not host:
+                print("  [AVERTISSEMENT] ligne {} : hôte vide, ignorée."
+                      .format(numero))
+                continue
+
+            cle = (host, port)
+            if cle in vus:
+                print("  [AVERTISSEMENT] ligne {} : doublon {}:{}, ignoré."
+                      .format(numero, host, port))
+                continue
+            vus.add(cle)
+
+            equipements.append((label or host, host, user, port))
+
     return equipements
 
 
-# ---------------------------------------------------------------- SSH
+# ------------------------------------------------------------------- SSH
 
-def executer_tmsh(client: paramiko.SSHClient, commande: str) -> str:
-    """Exécute une commande tmsh. Passe par 'tmsh -c' pour être indépendant
-    du shell de connexion (bash ou tmsh)."""
-    cmd = "tmsh -c '{}'".format(commande.replace("'", "'\\''"))
+def connecter(host: str, port: int, user: str,
+              password: str) -> paramiko.SSHClient:
+    """Ouvre une connexion SSH (clé d'hôte non vérifiée)."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=host,
+        port=port,
+        username=user,
+        password=password,
+        timeout=TIMEOUT_SSH,
+        banner_timeout=TIMEOUT_SSH,
+        auth_timeout=TIMEOUT_SSH,
+        allow_agent=False,
+        look_for_keys=False,
+    )
+    return client
+
+
+def detecter_shell(client: paramiko.SSHClient) -> str:
+    """Détecte le shell de connexion du compte : 'bash' ou 'tmsh'.
+
+    Sous bash, 'echo $0' renvoie le nom du shell. Sous tmsh, la commande
+    provoque une erreur de syntaxe (ou un retour vide) : on en déduit tmsh."""
+    try:
+        _, stdout, stderr = client.exec_command("echo $0", timeout=TIMEOUT_SSH)
+        sortie = stdout.read().decode("utf-8", errors="replace").strip().lower()
+        erreur = stderr.read().decode("utf-8", errors="replace").strip().lower()
+    except Exception:  # noqa: BLE001
+        return "tmsh"
+
+    if "syntax error" in sortie or "syntax error" in erreur:
+        return "tmsh"
+    if "bash" in sortie or sortie.endswith("sh"):
+        return "bash"
+    return "tmsh"
+
+
+def executer_tmsh(client: paramiko.SSHClient, commande: str,
+                  shell: str) -> str:
+    """Exécute une commande tmsh en l'adaptant au shell de connexion."""
+    if shell == "bash":
+        cmd = "tmsh -c '{}'".format(commande.replace("'", "'\\''"))
+    else:
+        cmd = commande          # le shell est déjà tmsh
+
     _, stdout, stderr = client.exec_command(cmd, timeout=TIMEOUT_COMMANDE)
     sortie = stdout.read().decode("utf-8", errors="replace")
     erreur = stderr.read().decode("utf-8", errors="replace")
+
+    if "syntax error" in sortie.lower() or "syntax error" in erreur.lower():
+        raise RuntimeError("tmsh (shell {}) : {}".format(
+            shell, (sortie or erreur).strip()))
     if not sortie.strip() and erreur.strip():
         raise RuntimeError("tmsh : {}".format(erreur.strip()))
     return sortie
 
 
-def connecter(host: str, port: int, user: str, password: str) -> paramiko.SSHClient:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(host, port=port, username=user, password=password,
-                   timeout=TIMEOUT_SSH, look_for_keys=False, allow_agent=False)
-    return client
+# ---------------------------------------------------------------- Parsing
 
-
-# ------------------------------------------------------------- Parseurs
-
-def decouper_blocs(texte: str, prefixe: str) -> List[List[str]]:
-    """Découpe une sortie 'field-fmt' en blocs, un par objet.
-    Un bloc commence par '<prefixe> <nom> {' et se termine par '}' au
-    niveau 0. Gère les sous-blocs imbriqués."""
-    blocs, courant, profondeur = [], None, 0
+def decouper_blocs(texte: str, entete: str) -> List[List[str]]:
+    """Découpe une sortie field-fmt en blocs commençant par 'entete'."""
+    blocs: List[List[str]] = []
+    courant: Optional[List[str]] = None
     for ligne in texte.splitlines():
-        brut = ligne.strip()
-        if courant is None:
-            if brut.startswith(prefixe + " ") and brut.endswith("{"):
-                courant = [brut]
-                profondeur = 1
-            continue
-        courant.append(brut)
-        profondeur += brut.count("{") - brut.count("}")
-        if profondeur <= 0:
-            blocs.append(courant)
-            courant, profondeur = None, 0
+        if ligne.startswith(entete + " "):
+            if courant is not None:
+                blocs.append(courant)
+            courant = [ligne]
+        elif courant is not None:
+            courant.append(ligne)
+    if courant is not None:
+        blocs.append(courant)
     return blocs
 
 
-def nom_du_bloc(bloc: List[str], prefixe: str) -> str:
-    entete = bloc[0][len(prefixe):].strip()
-    return entete.rstrip("{").strip()
-
-
-def valeur(bloc: List[str], cle: str) -> Optional[str]:
-    """Première valeur d'une clé simple 'cle valeur' dans le bloc."""
-    motif = re.compile(r"^{}\s+(.+)$".format(re.escape(cle)))
-    for ligne in bloc:
+def champ(lignes: List[str], nom: str) -> Optional[str]:
+    """Retourne la valeur du premier champ 'nom valeur' trouvé."""
+    motif = re.compile(r"^\s*" + re.escape(nom) + r"\s+(.+?)\s*$")
+    for ligne in lignes:
         m = motif.match(ligne)
         if m:
-            return m.group(1).strip()
+            return m.group(1)
     return None
 
 
-def extraire_statut(bloc: List[str]) -> Dict[str, Optional[str]]:
-    return {
-        "disponibilite": valeur(bloc, "status.availability-state"),
-        "etat": valeur(bloc, "status.enabled-state"),
-        "raison": valeur(bloc, "status.status-reason"),
-    }
-
-
-def parser_virtuals(texte: str) -> Dict[str, dict]:
-    resultat = {}
+def parser_virtuals(texte: str) -> List[Dict[str, Optional[str]]]:
+    resultat = []
     for bloc in decouper_blocs(texte, "ltm virtual"):
-        nom = nom_du_bloc(bloc, "ltm virtual")
-        entree = extraire_statut(bloc)
-        entree["destination"] = valeur(bloc, "destination")
-        resultat[nom] = entree
+        nom = bloc[0].split()[2]
+        resultat.append({
+            "nom": nom,
+            "destination": champ(bloc, "destination"),
+            "disponibilite": champ(bloc, "status.availability-state"),
+            "etat": champ(bloc, "status.enabled-state"),
+            "raison": champ(bloc, "status.status-reason"),
+        })
     return resultat
 
 
-def parser_nodes(texte: str) -> Dict[str, dict]:
-    resultat = {}
-    for bloc in decouper_blocs(texte, "ltm node"):
-        nom = nom_du_bloc(bloc, "ltm node")
-        entree = extraire_statut(bloc)
-        entree["adresse"] = valeur(bloc, "addr")
-        resultat[nom] = entree
-    return resultat
-
-
-def parser_pools(texte: str):
-    """Retourne (pools, membres).
-    pools   : {nom_pool: {disponibilite, etat}}
-    membres : {'nom_pool / adresse:port': {disponibilite, etat, raison}}"""
-    pools, membres = {}, {}
+def parser_pools(texte: str) -> List[Dict[str, object]]:
+    resultat = []
     for bloc in decouper_blocs(texte, "ltm pool"):
-        nom_pool = nom_du_bloc(bloc, "ltm pool")
-        pools[nom_pool] = extraire_statut(bloc)
-        pools[nom_pool].pop("raison", None)
-
-        # Membres : sous-blocs 'members { <nom> { ... } }'
-        dans_membres, profondeur_membres = False, 0
-        membre_nom, membre_lignes, profondeur_membre = None, [], 0
+        nom = bloc[0].split()[2]
+        membres = []
+        courant: Optional[Dict[str, Optional[str]]] = None
         for ligne in bloc[1:]:
-            if not dans_membres:
-                if ligne.startswith("members") and ligne.endswith("{"):
-                    dans_membres, profondeur_membres = True, 1
+            m = re.match(r"^\s*ltm pool \S+ members \{", ligne)
+            if m:
                 continue
-            if membre_nom is None:
-                if ligne.endswith("{") and not ligne.startswith("}"):
-                    membre_nom = ligne.rstrip("{").strip()
-                    membre_lignes, profondeur_membre = [], 1
-                else:
-                    profondeur_membres += ligne.count("{") - ligne.count("}")
-                    if profondeur_membres <= 0:
-                        dans_membres = False
+            m = re.match(r"^\s{4}(\S+)\s*\{\s*$", ligne)
+            if m:
+                courant = {"membre": m.group(1)}
+                membres.append(courant)
                 continue
-            membre_lignes.append(ligne)
-            profondeur_membre += ligne.count("{") - ligne.count("}")
-            if profondeur_membre <= 0:
-                cle = "{} / {}".format(nom_pool, membre_nom)
-                membres[cle] = extraire_statut(membre_lignes)
-                membre_nom = None
-    return pools, membres
+            if courant is not None:
+                for cle, nom_champ in (
+                        ("disponibilite", "status.availability-state"),
+                        ("etat", "status.enabled-state"),
+                        ("raison", "status.status-reason")):
+                    m = re.match(r"^\s+" + re.escape(nom_champ) + r"\s+(.+?)\s*$",
+                                 ligne)
+                    if m:
+                        courant[cle] = m.group(1)
+        resultat.append({
+            "nom": nom,
+            "disponibilite": champ(bloc, "status.availability-state"),
+            "etat": champ(bloc, "status.enabled-state"),
+            "membres": membres,
+        })
+    return resultat
 
 
-# ----------------------------------------------------------- Capture
+def parser_nodes(texte: str) -> List[Dict[str, Optional[str]]]:
+    resultat = []
+    for bloc in decouper_blocs(texte, "ltm node"):
+        nom = bloc[0].split()[2]
+        resultat.append({
+            "nom": nom,
+            "adresse": champ(bloc, "addr"),
+            "disponibilite": champ(bloc, "status.availability-state"),
+            "etat": champ(bloc, "status.enabled-state"),
+            "raison": champ(bloc, "status.status-reason"),
+        })
+    return resultat
+
+
+# ---------------------------------------------------------------- Capture
+
+def assainir(nom: str) -> str:
+    """Rend un label utilisable comme nom de dossier."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", nom)
+
 
 def capturer_equipement(label: str, host: str, port: int, user: str,
                         password: str, phase: str, racine: Path) -> Path:
+    """Capture l'état d'un équipement et retourne le dossier créé."""
     horodatage = datetime.now().strftime("%Y%m%d_%H%M%S")
-    nom_sain = re.sub(r"[^\w.\-]", "_", label)
-    dossier = racine / "{}_{}_{}".format(nom_sain, phase, horodatage)
+    dossier = racine / "{}_{}_{}".format(assainir(label), phase, horodatage)
     dossier.mkdir(parents=True, exist_ok=True)
 
     client = connecter(host, port, user, password)
     try:
-        sorties = {}
+        shell = detecter_shell(client)
+        print("  Shell détecté : {}".format(shell))
+
+        sorties: Dict[str, str] = {}
         for fichier, commande in COMMANDES_TMSH:
-            texte = executer_tmsh(client, commande)
+            texte = executer_tmsh(client, commande, shell)
             (dossier / fichier).write_text(texte, encoding="utf-8")
             sorties[fichier] = texte
             print("  [OK] {:<20} {} octets".format(fichier, len(texte)))
     finally:
         client.close()
 
-    virtuals = parser_virtuals(sorties["state_virtual.txt"])
-    pools, membres = parser_pools(sorties["state_pool.txt"])
-    nodes = parser_nodes(sorties["state_node.txt"])
-
     resume = {
         "label": label,
         "host": host,
         "phase": phase,
         "horodatage": horodatage,
-        "ltm_virtual": virtuals,
-        "ltm_pool": pools,
-        "ltm_pool_member": membres,
-        "ltm_node": nodes,
+        "shell": shell,
+        "virtuals": parser_virtuals(sorties["state_virtual.txt"]),
+        "pools": parser_pools(sorties["state_pool.txt"]),
+        "nodes": parser_nodes(sorties["state_node.txt"]),
     }
     (dossier / "state_summary.json").write_text(
         json.dumps(resume, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    print("  Résumé : {} virtual(s), {} pool(s), {} membre(s), {} node(s)".format(
-        len(virtuals), len(pools), len(membres), len(nodes)))
-    hors_common = sum(1 for n in virtuals if not n.startswith("/Common/"))
-    print("  Dont {} virtual(s) hors /Common".format(hors_common))
+    print("  Virtuals: {}  Pools: {}  Nodes: {}".format(
+        len(resume["virtuals"]), len(resume["pools"]), len(resume["nodes"])))
     return dossier
 
 
-# ------------------------------------------------------------- Entrée
+# ------------------------------------------------------------------- Main
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Capture de l'état runtime BIG-IP (multi-équipements).")
+        description="Capture de l'état runtime de BIG-IP (before / after).")
     parser.add_argument("-f", "--fichier",
-                        help="fichier d'équipements (label;host[;user[;port]])")
-    parser.add_argument("--phase", choices=["before", "after"],
-                        help="état de la capture (demandé si absent)")
-    parser.add_argument("-u", "--user",
-                        help="utilisateur par défaut (demandé si absent)")
-    parser.add_argument("--host", help="équipement unique (sans fichier)")
+                        help="fichier d'équipements (label;host;user;port)")
+    parser.add_argument("--host", help="équipement unique (IP ou nom)")
     parser.add_argument("--label", help="label de l'équipement unique")
-    parser.add_argument("--port", type=int, default=PORT_DEFAUT)
-    parser.add_argument("--captures", default=REPERTOIRE_CAPTURES)
+    parser.add_argument("--port", type=int, default=PORT_DEFAUT,
+                        help="port SSH par défaut (défaut : 22)")
+    parser.add_argument("-u", "--user", help="utilisateur SSH")
+    parser.add_argument("--phase", choices=("before", "after"),
+                        help="état de la capture (demandé si absent)")
+    parser.add_argument("--captures", default=REPERTOIRE_CAPTURES,
+                        help="répertoire de sortie (défaut : captures)")
     args = parser.parse_args()
 
-    # 1) État before / after
-    phase = args.phase or demander_phase()
-
-    # 2) Équipements : fichier, arguments, ou saisie interactive
+    # 1) Liste des équipements
+    equipements: List[Equipement] = []
     if args.fichier:
-        equipements = lire_fichier_hosts(args.fichier)
+        try:
+            equipements = lire_fichier_hosts(args.fichier)
+        except OSError as exc:
+            print("Erreur de lecture du fichier : {}".format(exc))
+            return 2
+        if not equipements:
+            print("Aucun équipement valide dans {}.".format(args.fichier))
+            return 2
     elif args.host:
         equipements = [(args.label or args.host, args.host, None, args.port)]
     else:
-        equipements = demander_equipement_unique()
+        try:
+            equipements = [demander_equipement()]
+        except (ValueError, KeyboardInterrupt) as exc:
+            print("Abandon : {}".format(exc))
+            return 2
 
-    if not equipements:
-        print("Aucun équipement à traiter.")
+    # 2) Phase, utilisateur et mot de passe
+    phase = args.phase or demander_phase()
+    user_defaut = args.user or input("Utilisateur SSH : ").strip()
+    if not user_defaut:
+        print("Utilisateur obligatoire.")
         return 2
 
-    # 3) Identifiants : utilisateur par défaut + mot de passe unique
-    user_defaut = args.user or input("Utilisateur par défaut [admin] : ").strip() or "admin"
-    password = os.environ.get("BIGIP_PASSWORD") or getpass.getpass("Mot de passe : ")
-
-    print("\nPhase : {} | {} équipement(s)".format(phase.upper(), len(equipements)))
+    print("\nPhase : {} | {} équipement(s)".format(phase.upper(),
+                                                   len(equipements)))
+    password = os.environ.get("BIGIP_PASSWORD") or getpass.getpass(
+        "Mot de passe : ")
 
     racine = Path(args.captures)
     racine.mkdir(parents=True, exist_ok=True)
 
-    ok, erreurs = 0, []
+    # 3) Capture de chaque équipement (on continue en cas d'erreur)
+    ok = 0
+    erreurs: List[Tuple[str, str]] = []
     for label, host, user, port in equipements:
         utilisateur = user or user_defaut
         print("\n=== {} ({}:{}) - {} - phase {} ===".format(
