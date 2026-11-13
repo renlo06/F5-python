@@ -7,8 +7,10 @@ Fichiers récupérés :
     /config/bigip_base.conf
     /config/partitions/<partition>/bigip.conf   (une par partition)
 
+Sans --phase, demande la phase de capture : 1 = before, 2 = after.
+
 Usage:
-    python capture_conf.py --host 10.0.0.11 --label bigip-a [--phase before|after]
+    python capture_conf.py --host 10.0.0.11 --label bigip-a [--phase 1|2]
     python capture_conf.py -f equipements.txt [--phase before|after] [--shell tmsh]
 
 Format du fichier d'équipements (une ligne par équipement) :
@@ -72,6 +74,20 @@ def adapter_commande_bash(cmd_bash: str, shell: str) -> str:
     if shell == "tmsh":
         return "run /util bash -c {}".format(shlex.quote(cmd_bash))
     raise ValueError("shell non pris en charge : {}".format(shell))
+
+
+def _erreur_shell(sortie: str, erreur: str) -> bool:
+    """Détecte l'erreur typique d'un mauvais choix de shell (tmsh vs bash)."""
+    texte = (sortie + " " + erreur).lower()
+    return (
+        ("syntax error" in texte and "unexpected argument" in texte)
+        or "command not found" in texte
+        or "unexpected argument" in texte
+    )
+
+
+def autre_shell(shell: str) -> str:
+    return "bash" if shell == "tmsh" else "tmsh"
 
 
 def _methodes_autorisees(erreurs: List[BaseException]) -> List[str]:
@@ -162,11 +178,30 @@ def _nettoyer_secret(texte: str, secret: str) -> str:
     return texte.replace(secret, "[MASQUÉ]") if secret else texte
 
 
+def run_bash_adaptatif(client: Any, cmd_bash: str, shell: str, timeout: int = 180,
+                       brut: bool = False) -> Tuple[Any, str, int, str]:
+    """Exécute une commande bash avec repli automatique sur l'autre shell.
+
+    Renvoie (stdout, stderr, code, shell_effectif). Le repli n'a lieu que si
+    l'échec ressemble à une mauvaise détection de shell, jamais pour une
+    vraie erreur de commande (fichier absent, etc.)."""
+    executeur = run_brut if brut else run
+    dernier: Tuple[Any, str, int, str] = ("", "", 1, shell)
+    for candidat in (shell, autre_shell(shell)):
+        out, err, rc = executeur(client, adapter_commande_bash(cmd_bash, candidat), timeout=timeout)
+        out_txt = out.decode("utf-8", errors="replace") if isinstance(out, bytes) else out
+        dernier = (out, err, rc, candidat)
+        if rc == 0 and not _erreur_shell(out_txt if not brut else "", err):
+            return dernier
+        if not _erreur_shell(out_txt if not brut else "", err):
+            break  # vraie erreur de commande : inutile de changer de shell
+    return dernier
+
+
 def lister_partitions(client: Any, shell: str) -> List[str]:
     """Liste les partitions ayant un bigip.conf dédié (hors Common)."""
-    cmd = adapter_commande_bash(
-        "ls -1 {}/partitions 2>/dev/null".format(CONFIG_DIR), shell)
-    out, _err, rc = run(client, cmd, timeout=60)
+    out, _err, _rc, _sh = run_bash_adaptatif(
+        client, "ls -1 {}/partitions 2>/dev/null".format(CONFIG_DIR), shell, timeout=60)
     partitions: List[str] = []
     for ligne in out.splitlines():
         nom = ligne.strip()
@@ -184,11 +219,12 @@ def recuperer_fichier(client: Any, shell: str, chemin_distant: str,
                       chemin_local: Path, password: str) -> Dict[str, Any]:
     """Lit un fichier distant par cat, vérifie la taille et écrit en local."""
     # shlex.quote protège le chemin ; les noms de partition sont déjà validés.
-    cmd_cat = adapter_commande_bash("cat {}".format(shlex.quote(chemin_distant)), shell)
-    cmd_wc = adapter_commande_bash("wc -c < {}".format(shlex.quote(chemin_distant)), shell)
+    cmd_cat = "cat {}".format(shlex.quote(chemin_distant))
+    cmd_wc = "wc -c < {}".format(shlex.quote(chemin_distant))
 
     try:
-        contenu, err, rc = run_brut(client, cmd_cat, timeout=180)
+        contenu, err, rc, shell_effectif = run_bash_adaptatif(
+            client, cmd_cat, shell, timeout=180, brut=True)
     except Exception as exc:
         return {"status": "ERREUR", "bytes": 0,
                 "error": _nettoyer_secret(str(exc), password)}
@@ -202,7 +238,8 @@ def recuperer_fichier(client: Any, shell: str, chemin_distant: str,
     # Contrôle d'intégrité : taille annoncée par le BIG-IP = octets reçus.
     taille_distante: Optional[int] = None
     try:
-        out_wc, _e, rc_wc = run(client, cmd_wc, timeout=60)
+        out_wc, _e, rc_wc, _sh = run_bash_adaptatif(
+            client, cmd_wc, shell_effectif, timeout=60)
         if rc_wc == 0 and out_wc.strip().isdigit():
             taille_distante = int(out_wc.strip())
     except Exception:
@@ -259,13 +296,31 @@ def lire_fichier_equipements(path: Path) -> List[Tuple[str, int, str]]:
     return equipements
 
 
+def normaliser_phase(value: str) -> str:
+    """Accepte 1/2, before/after, b/a, avant/apres."""
+    value = value.strip().lower()
+    aliases = {"1": "before", "b": "before", "avant": "before",
+               "2": "after", "a": "after", "apres": "after", "après": "after"}
+    value = aliases.get(value, value)
+    if value not in ("before", "after"):
+        raise argparse.ArgumentTypeError("la phase doit être 1/before ou 2/after")
+    return value
+
+
 def demander_phase() -> str:
-    """Demande interactivement la phase de capture."""
+    """Demande interactivement la phase de capture (1 = before, 2 = after)."""
+    print("Quelle est la phase de cette capture ?")
+    print("  1) before (avant l'intervention)")
+    print("  2) after  (après l'intervention)")
     while True:
-        reponse = input("Phase de capture (before/after) : ").strip().lower()
-        if reponse in ("before", "after"):
-            return reponse
-        print("Réponse invalide, saisir 'before' ou 'after'.")
+        try:
+            reponse = input("Choix [1/2] : ")
+        except EOFError as exc:
+            raise RuntimeError("aucune phase fournie") from exc
+        try:
+            return normaliser_phase(reponse)
+        except argparse.ArgumentTypeError:
+            print("Valeur invalide. Saisir 1 (before) ou 2 (after).", file=sys.stderr)
 
 
 def capturer_equipement(host: str, port: int, label: str, phase: str,
@@ -353,8 +408,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=22, help="Port SSH avec --host (défaut : 22)")
     parser.add_argument("--user", help="Login SSH (demandé si absent)")
     parser.add_argument("--label", help="Étiquette d'équipement avec --host (défaut : l'hôte)")
-    parser.add_argument("--phase", choices=("before", "after"),
-                        help="Phase de capture (demandée si absente)")
+    parser.add_argument("--phase", type=normaliser_phase,
+                        help="Phase de capture : 1/before ou 2/after (demandée si absente)")
     parser.add_argument("--shell", choices=("auto", "tmsh", "bash"), default="auto",
                         help="Forcer le shell distant (défaut : détection automatique)")
     parser.add_argument("--outdir", default="captures", help="Répertoire de sortie")
