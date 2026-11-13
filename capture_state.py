@@ -5,12 +5,14 @@
 Ne collecte QUE l'état, sans aucune statistique (connexions, octets, paquets) :
     - virtual servers : disponibilité, état activé/désactivé, raison
     - pools           : disponibilité, état activé/désactivé
-    - pool members    : disponibilité, état activé/désactivé, raison
+    - pool members    : IP:port, disponibilité, état activé/désactivé, raison
 
 Produit dans captures/<label>_<phase>_<horodatage>/ :
     state_virtual.txt   (statuts des virtual servers)
     state_pool.txt      (statuts des pools et de leurs membres)
+    raw_virtual.txt     (sortie brute tmsh des virtuals, pour diagnostic)
     raw_pool.txt        (sortie brute tmsh des pools, pour diagnostic)
+    raw_members.txt     (sortie brute tmsh des membres, pour diagnostic)
     state_summary.json  (données structurées)
 
 Usage:
@@ -53,14 +55,10 @@ PORT_DEFAUT = 22
 
 # /*/* = toutes les partitions (sans cela, seule /Common est retournée)
 CMD_VIRTUAL = "show ltm virtual /*/* field-fmt"
-CMD_POOL = "show ltm pool /*/* members field-fmt"
-
-# Champs d'état conservés (tout le reste = statistiques, ignoré)
-CHAMPS_ETAT = (
-    "status.availability-state",
-    "status.enabled-state",
-    "status.status-reason",
-)
+CMD_POOL = "show ltm pool /*/* field-fmt"
+# Détail de CHAQUE membre (avec son IP:port), pas seulement les compteurs
+CMD_MEMBERS = "show ltm pool /*/* members field-fmt"
+CMD_MEMBERS_ALT = "show ltm pool members /*/* field-fmt"
 
 # (label, host, user ou None, port)
 Equipement = Tuple[str, str, Optional[str], int]
@@ -206,15 +204,47 @@ def executer_tmsh(client: paramiko.SSHClient, commande: str,
     return sortie
 
 
+def recuperer_membres(client: paramiko.SSHClient,
+                      shell: str) -> Tuple[str, str]:
+    """Récupère le détail des membres de pool (avec leur IP:port).
+
+    Essaie d'abord la forme 'show ltm pool members', puis la forme
+    'show ltm pool ... members' si la première échoue ou ne contient pas
+    de ligne de membre. Retourne (sortie_brute, commande_utilisée)."""
+    dernier_brut = ""
+    derniere_cmd = CMD_MEMBERS_ALT
+    for commande in (CMD_MEMBERS_ALT, CMD_MEMBERS):
+        derniere_cmd = commande
+        try:
+            brut = executer_tmsh(client, commande, shell)
+        except RuntimeError:
+            continue
+        dernier_brut = brut
+        if RE_MEMBRE_ADRESSE.search(brut):
+            return brut, commande
+    return dernier_brut, derniere_cmd
+
+
 # ---------------------------------------------------------------- Parsing
 
 RE_VIRTUAL = re.compile(r"^ltm virtual (\S+)\s*\{")
 RE_POOL = re.compile(r"^ltm pool (\S+)\s*\{")
-# Membre : 'ltm pool /P/pool members /P/10.0.0.1:80 {'  (une seule ligne)
+# Membre en en-tête : 'ltm pool /P/pool members /P/10.0.0.1:80 {'
 RE_MEMBRE_INLINE = re.compile(r"^ltm pool (\S+) members (\S+)\s*\{")
-# Membre sur plusieurs lignes : '    /P/10.0.0.1:80 {' dans le bloc 'members {'
-RE_MEMBRE_BLOC = re.compile(r"^(\S+:\S+)\s*\{$")
+# Membre imbriqué : '/P/10.0.0.1:80 {' ou '/P/srv:80 {'
+RE_MEMBRE_BLOC = re.compile(r"^(/\S+:\S+)\s*\{$")
+# Détecte la présence d'au moins une adresse de membre (ip:port ou nom:port)
+RE_MEMBRE_ADRESSE = re.compile(r"/\S+:[0-9A-Za-z_-]+\s*\{")
 RE_CHAMP = re.compile(r"^(\S+)\s+(.+)$")
+
+
+def cle_etat(cle: str) -> Optional[str]:
+    """Convertit un champ tmsh d'état en clé interne (None si ignoré)."""
+    return {
+        "status.availability-state": "disponibilite",
+        "status.enabled-state": "etat",
+        "status.status-reason": "raison",
+    }.get(cle)
 
 
 def parser_virtuals(texte: str) -> List[Dict[str, Optional[str]]]:
@@ -238,84 +268,105 @@ def parser_virtuals(texte: str) -> List[Dict[str, Optional[str]]]:
         cle, valeur = m.group(1), m.group(2).strip()
         if cle == "destination":
             courant["destination"] = valeur
-        elif cle == "status.availability-state":
-            courant["disponibilite"] = valeur
-        elif cle == "status.enabled-state":
-            courant["etat"] = valeur
-        elif cle == "status.status-reason":
-            courant["raison"] = valeur
+        elif cle_etat(cle):
+            courant[cle_etat(cle)] = valeur  # type: ignore[index]
     return resultat
 
 
-def parser_pools(texte: str) -> List[Dict[str, object]]:
-    """Extrait pools et membres de façon tolérante au format.
+def parser_pools(texte: str) -> Dict[str, Dict[str, Optional[str]]]:
+    """Extrait l'état de chaque pool : {nom_pool: {disponibilite, etat}}."""
+    pools: Dict[str, Dict[str, Optional[str]]] = {}
+    courant: Optional[Dict[str, Optional[str]]] = None
 
-    Gère les deux présentations de tmsh :
-      - membre sur une ligne d'en-tête : 'ltm pool /P/x members /P/n:80 {'
-      - membre imbriqué dans un bloc 'members { ... }'
-    Un champ d'état est rattaché au membre courant s'il y en a un,
-    sinon au pool."""
-    pools: List[Dict[str, object]] = []
-    pool: Optional[Dict[str, object]] = None
+    for ligne in texte.splitlines():
+        brut = ligne.strip()
+        m = RE_POOL.match(brut)
+        if m:
+            courant = {"disponibilite": None, "etat": None, "raison": None}
+            pools[m.group(1)] = courant
+            continue
+        if courant is None:
+            continue
+        m = RE_CHAMP.match(brut)
+        if not m:
+            continue
+        interne = cle_etat(m.group(1))
+        if interne:
+            courant[interne] = m.group(2).strip()
+    return pools
+
+
+def parser_membres(texte: str) -> Dict[str, List[Dict[str, Optional[str]]]]:
+    """Extrait les membres de chaque pool : {nom_pool: [membres]}.
+
+    Tolère les deux présentations de tmsh :
+      - 'ltm pool /P/x members /P/n:80 {' (membre en en-tête)
+      - bloc 'ltm pool /P/x { members { /P/n:80 { ... } } }' (imbriqué)
+    Les champs de statistiques sont ignorés."""
+    resultat: Dict[str, List[Dict[str, Optional[str]]]] = {}
+    pool_courant: Optional[str] = None
     membre: Optional[Dict[str, Optional[str]]] = None
 
-    def cle_etat(cle: str) -> Optional[str]:
-        return {
-            "status.availability-state": "disponibilite",
-            "status.enabled-state": "etat",
-            "status.status-reason": "raison",
-        }.get(cle)
+    def ajouter(nom_pool: str, nom_membre: str) -> Dict[str, Optional[str]]:
+        entree = {"membre": nom_membre, "disponibilite": None,
+                  "etat": None, "raison": None}
+        resultat.setdefault(nom_pool, []).append(entree)
+        return entree
 
     for ligne in texte.splitlines():
         brut = ligne.strip()
         if not brut:
             continue
 
-        # Membre en en-tête inline (testé avant le pool, plus spécifique)
         m = RE_MEMBRE_INLINE.match(brut)
         if m:
-            nom_pool, nom_membre = m.group(1), m.group(2)
-            if pool is None or pool["nom"] != nom_pool:
-                pool = {"nom": nom_pool, "disponibilite": None, "etat": None,
-                        "membres": []}
-                pools.append(pool)
-            membre = {"membre": nom_membre, "disponibilite": None,
-                      "etat": None, "raison": None}
-            pool["membres"].append(membre)  # type: ignore[union-attr]
+            pool_courant = m.group(1)
+            membre = ajouter(pool_courant, m.group(2))
             continue
 
-        # Nouveau pool
         m = RE_POOL.match(brut)
         if m:
-            pool = {"nom": m.group(1), "disponibilite": None, "etat": None,
-                    "membres": []}
-            pools.append(pool)
+            pool_courant = m.group(1)
             membre = None
             continue
 
-        if pool is None:
+        if pool_courant is None:
             continue
 
-        # Membre imbriqué : '/P/10.0.0.1:80 {'
         m = RE_MEMBRE_BLOC.match(brut)
         if m:
-            membre = {"membre": m.group(1), "disponibilite": None,
-                      "etat": None, "raison": None}
-            pool["membres"].append(membre)  # type: ignore[union-attr]
+            membre = ajouter(pool_courant, m.group(1))
             continue
 
-        # Champ d'état
-        m = RE_CHAMP.match(brut)
-        if m:
-            cle, valeur = m.group(1), m.group(2).strip()
-            cle_interne = cle_etat(cle)
-            if cle_interne is None:
-                continue
-            if membre is not None:
-                membre[cle_interne] = valeur
-            elif cle_interne in ("disponibilite", "etat"):
-                pool[cle_interne] = valeur
-    return pools
+        if membre is not None:
+            m = RE_CHAMP.match(brut)
+            if m:
+                interne = cle_etat(m.group(1))
+                if interne:
+                    membre[interne] = m.group(2).strip()
+    return resultat
+
+
+def assembler_pools(etat_pools: Dict[str, Dict[str, Optional[str]]],
+                    membres: Dict[str, List[Dict[str, Optional[str]]]]
+                    ) -> List[Dict[str, object]]:
+    """Fusionne l'état des pools et la liste de leurs membres."""
+    noms = list(etat_pools.keys())
+    for nom in membres:
+        if nom not in etat_pools:
+            noms.append(nom)
+
+    resultat: List[Dict[str, object]] = []
+    for nom in noms:
+        etat = etat_pools.get(nom, {})
+        resultat.append({
+            "nom": nom,
+            "disponibilite": etat.get("disponibilite"),
+            "etat": etat.get("etat"),
+            "raison": etat.get("raison"),
+            "membres": membres.get(nom, []),
+        })
+    return resultat
 
 
 def ecrire_etat_virtuals(virtuals: List[Dict[str, Optional[str]]],
@@ -374,14 +425,20 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
         print("  Shell détecté : {}".format(shell))
         brut_virtual = executer_tmsh(client, CMD_VIRTUAL, shell)
         brut_pool = executer_tmsh(client, CMD_POOL, shell)
+        brut_membres, cmd_membres = recuperer_membres(client, shell)
+        print("  Commande membres retenue : {}".format(cmd_membres))
     finally:
         client.close()
 
-    # Sortie brute des pools conservée pour diagnostic
+    # Sorties brutes conservées pour diagnostic
+    (dossier / "raw_virtual.txt").write_text(brut_virtual, encoding="utf-8")
     (dossier / "raw_pool.txt").write_text(brut_pool, encoding="utf-8")
+    (dossier / "raw_members.txt").write_text(brut_membres, encoding="utf-8")
 
     virtuals = parser_virtuals(brut_virtual)
-    pools = parser_pools(brut_pool)
+    etat_pools = parser_pools(brut_pool)
+    membres = parser_membres(brut_membres)
+    pools = assembler_pools(etat_pools, membres)
     nb_membres = sum(len(p["membres"]) for p in pools)  # type: ignore[arg-type]
 
     ecrire_etat_virtuals(virtuals, dossier / "state_virtual.txt")
@@ -393,6 +450,7 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
         "phase": phase,
         "horodatage": horodatage,
         "shell": shell,
+        "commande_membres": cmd_membres,
         "virtuals": virtuals,
         "pools": pools,
     }
@@ -404,7 +462,7 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
 
     if pools and nb_membres == 0:
         print("  [AVERTISSEMENT] {} pool(s) trouvé(s) mais 0 membre. "
-              "Vérifie raw_pool.txt : le format tmsh est peut-être "
+              "Vérifie raw_members.txt : le format tmsh est peut-être "
               "différent.".format(len(pools)))
     return dossier
 
