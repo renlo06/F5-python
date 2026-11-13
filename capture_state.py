@@ -10,10 +10,9 @@ Ne collecte QUE l'état, sans aucune statistique (connexions, octets, paquets) :
 Produit dans captures/<label>_<phase>_<horodatage>/ :
     state_virtual.txt   (statuts des virtual servers)
     state_pool.txt      (statuts des pools et de leurs membres)
-    raw_virtual.txt     (sortie brute tmsh des virtuals, pour diagnostic)
-    raw_pool.txt        (sortie brute tmsh des pools, pour diagnostic)
-    raw_members.txt     (sortie brute tmsh des membres, pour diagnostic)
     state_summary.json  (données structurées)
+
+Aucune sortie brute n'est conservée : seuls les champs d'état sont écrits.
 
 Usage:
     python capture_state.py -f hosts.txt
@@ -56,9 +55,8 @@ PORT_DEFAUT = 22
 # /*/* = toutes les partitions (sans cela, seule /Common est retournée)
 CMD_VIRTUAL = "show ltm virtual /*/* field-fmt"
 CMD_POOL = "show ltm pool /*/* field-fmt"
-# Détail de CHAQUE membre (avec son IP:port), pas seulement les compteurs
-CMD_MEMBERS = "show ltm pool /*/* members field-fmt"
-CMD_MEMBERS_ALT = "show ltm pool members /*/* field-fmt"
+# Configuration des pools : contient la liste des membres (nom + adresse)
+CMD_POOL_CONFIG = "list ltm pool /*/* members"
 
 # (label, host, user ou None, port)
 Equipement = Tuple[str, str, Optional[str], int]
@@ -204,37 +202,12 @@ def executer_tmsh(client: paramiko.SSHClient, commande: str,
     return sortie
 
 
-def recuperer_membres(client: paramiko.SSHClient,
-                      shell: str) -> Tuple[str, str]:
-    """Récupère le détail des membres de pool (avec leur IP:port).
-
-    Essaie d'abord la forme 'show ltm pool members', puis la forme
-    'show ltm pool ... members' si la première échoue ou ne contient pas
-    de ligne de membre. Retourne (sortie_brute, commande_utilisée)."""
-    dernier_brut = ""
-    derniere_cmd = CMD_MEMBERS_ALT
-    for commande in (CMD_MEMBERS_ALT, CMD_MEMBERS):
-        derniere_cmd = commande
-        try:
-            brut = executer_tmsh(client, commande, shell)
-        except RuntimeError:
-            continue
-        dernier_brut = brut
-        if RE_MEMBRE_ADRESSE.search(brut):
-            return brut, commande
-    return dernier_brut, derniere_cmd
-
-
 # ---------------------------------------------------------------- Parsing
 
 RE_VIRTUAL = re.compile(r"^ltm virtual (\S+)\s*\{")
 RE_POOL = re.compile(r"^ltm pool (\S+)\s*\{")
-# Membre en en-tête : 'ltm pool /P/pool members /P/10.0.0.1:80 {'
-RE_MEMBRE_INLINE = re.compile(r"^ltm pool (\S+) members (\S+)\s*\{")
-# Membre imbriqué : '/P/10.0.0.1:80 {' ou '/P/srv:80 {'
+# Membre dans la config : '/Common/10.0.0.11:80 {' ou '/Common/srv:80 {'
 RE_MEMBRE_BLOC = re.compile(r"^(/\S+:\S+)\s*\{$")
-# Détecte la présence d'au moins une adresse de membre (ip:port ou nom:port)
-RE_MEMBRE_ADRESSE = re.compile(r"/\S+:[0-9A-Za-z_-]+\s*\{")
 RE_CHAMP = re.compile(r"^(\S+)\s+(.+)$")
 
 
@@ -296,54 +269,63 @@ def parser_pools(texte: str) -> Dict[str, Dict[str, Optional[str]]]:
     return pools
 
 
-def parser_membres(texte: str) -> Dict[str, List[Dict[str, Optional[str]]]]:
-    """Extrait les membres de chaque pool : {nom_pool: [membres]}.
+def parser_config_membres(texte: str) -> Dict[str, List[str]]:
+    """Extrait, depuis 'list ltm pool ... members', les noms des membres.
 
-    Tolère les deux présentations de tmsh :
-      - 'ltm pool /P/x members /P/n:80 {' (membre en en-tête)
-      - bloc 'ltm pool /P/x { members { /P/n:80 { ... } } }' (imbriqué)
-    Les champs de statistiques sont ignorés."""
-    resultat: Dict[str, List[Dict[str, Optional[str]]]] = {}
+    Retourne {nom_pool: ['/Common/10.0.0.11:80', ...]}. Seuls les noms
+    sont lus (aucune statistique dans une sortie 'list')."""
+    resultat: Dict[str, List[str]] = {}
     pool_courant: Optional[str] = None
-    membre: Optional[Dict[str, Optional[str]]] = None
-
-    def ajouter(nom_pool: str, nom_membre: str) -> Dict[str, Optional[str]]:
-        entree = {"membre": nom_membre, "disponibilite": None,
-                  "etat": None, "raison": None}
-        resultat.setdefault(nom_pool, []).append(entree)
-        return entree
 
     for ligne in texte.splitlines():
         brut = ligne.strip()
-        if not brut:
-            continue
-
-        m = RE_MEMBRE_INLINE.match(brut)
-        if m:
-            pool_courant = m.group(1)
-            membre = ajouter(pool_courant, m.group(2))
-            continue
-
         m = RE_POOL.match(brut)
         if m:
             pool_courant = m.group(1)
-            membre = None
+            resultat.setdefault(pool_courant, [])
             continue
-
         if pool_courant is None:
             continue
-
         m = RE_MEMBRE_BLOC.match(brut)
         if m:
-            membre = ajouter(pool_courant, m.group(1))
-            continue
+            resultat[pool_courant].append(m.group(1))
+    return resultat
 
-        if membre is not None:
-            m = RE_CHAMP.match(brut)
-            if m:
-                interne = cle_etat(m.group(1))
-                if interne:
-                    membre[interne] = m.group(2).strip()
+
+def parser_etat_membre(texte: str) -> Dict[str, Optional[str]]:
+    """Extrait l'état d'UN membre depuis la sortie de 'show ... members'."""
+    etat: Dict[str, Optional[str]] = {"disponibilite": None, "etat": None,
+                                      "raison": None}
+    for ligne in texte.splitlines():
+        m = RE_CHAMP.match(ligne.strip())
+        if not m:
+            continue
+        interne = cle_etat(m.group(1))
+        if interne and etat[interne] is None:
+            etat[interne] = m.group(2).strip()
+    return etat
+
+
+def recuperer_etat_membres(client: paramiko.SSHClient, shell: str,
+                           membres_par_pool: Dict[str, List[str]]
+                           ) -> Dict[str, List[Dict[str, Optional[str]]]]:
+    """Interroge l'état de chaque membre, pool par pool.
+
+    Une requête 'show' par membre : c'est la seule façon d'obtenir l'état
+    individuel quand 'show ltm pool ... field-fmt' ne détaille pas les
+    membres. Seuls les champs d'état sont conservés."""
+    resultat: Dict[str, List[Dict[str, Optional[str]]]] = {}
+    for pool, noms in membres_par_pool.items():
+        resultat[pool] = []
+        for nom in noms:
+            commande = "show ltm pool {} members {{ {} {{ }} }} field-fmt" \
+                .format(pool, nom)
+            try:
+                brut = executer_tmsh(client, commande, shell)
+                etat = parser_etat_membre(brut)
+            except RuntimeError:
+                etat = {"disponibilite": None, "etat": None, "raison": None}
+            resultat[pool].append({"membre": nom, **etat})
     return resultat
 
 
@@ -425,19 +407,16 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
         print("  Shell détecté : {}".format(shell))
         brut_virtual = executer_tmsh(client, CMD_VIRTUAL, shell)
         brut_pool = executer_tmsh(client, CMD_POOL, shell)
-        brut_membres, cmd_membres = recuperer_membres(client, shell)
-        print("  Commande membres retenue : {}".format(cmd_membres))
+        brut_config = executer_tmsh(client, CMD_POOL_CONFIG, shell)
+
+        # Liste des membres (noms), puis état de chacun
+        membres_par_pool = parser_config_membres(brut_config)
+        membres = recuperer_etat_membres(client, shell, membres_par_pool)
     finally:
         client.close()
 
-    # Sorties brutes conservées pour diagnostic
-    (dossier / "raw_virtual.txt").write_text(brut_virtual, encoding="utf-8")
-    (dossier / "raw_pool.txt").write_text(brut_pool, encoding="utf-8")
-    (dossier / "raw_members.txt").write_text(brut_membres, encoding="utf-8")
-
     virtuals = parser_virtuals(brut_virtual)
     etat_pools = parser_pools(brut_pool)
-    membres = parser_membres(brut_membres)
     pools = assembler_pools(etat_pools, membres)
     nb_membres = sum(len(p["membres"]) for p in pools)  # type: ignore[arg-type]
 
@@ -450,7 +429,6 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
         "phase": phase,
         "horodatage": horodatage,
         "shell": shell,
-        "commande_membres": cmd_membres,
         "virtuals": virtuals,
         "pools": pools,
     }
@@ -461,9 +439,9 @@ def capturer_equipement(label: str, host: str, port: int, user: str,
         len(virtuals), len(pools), nb_membres))
 
     if pools and nb_membres == 0:
-        print("  [AVERTISSEMENT] {} pool(s) trouvé(s) mais 0 membre. "
-              "Vérifie raw_members.txt : le format tmsh est peut-être "
-              "différent.".format(len(pools)))
+        print("  [AVERTISSEMENT] {} pool(s) trouvé(s) mais 0 membre : "
+              "vérifie que les pools ont des membres configurés."
+              .format(len(pools)))
     return dossier
 
 
