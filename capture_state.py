@@ -1,346 +1,275 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Relevé en lecture seule de l'état runtime BIG-IP : virtual servers, pools,
-membres, nodes. Les pools sont relevés sur TOUTES les partitions via /*/*.
+"""Capture de l'état runtime d'un BIG-IP (avant / après une intervention).
 
-Fichiers produits (captures/<label>_<phase>_<horodatage>/) :
-    state_virtual.txt      show ltm virtual field-fmt
-    state_pool.txt         show ltm pool /*/* members field-fmt
-    state_node.txt         show ltm node field-fmt
-    state_summary.json     synthèse parsée
-    _meta_state.json       métadonnées (shell, durées, tailles, SHA256)
+Relève, pour TOUTES les partitions :
+    - virtual servers
+    - pools et membres
+    - nodes
+
+Produit dans captures/<label>_<phase>_<horodatage>/ :
+    state_virtual.txt, state_pool.txt, state_node.txt   (sorties brutes tmsh)
+    state_summary.json                                  (données structurées)
 
 Usage:
-    python capture_state.py --host 10.0.0.11 --label bigip-a [--phase before|after]
-    python capture_state.py -f equipements.txt [--phase before|after]
+    python capture_state.py --host 10.0.0.1 --label bigip-a --phase before
+    python capture_state.py -f equipements.txt --phase after
 
-Format de equipements.txt (une ligne par équipement, '#' = commentaire) :
-    10.0.0.11  bigip-a
-    10.0.0.12  bigip-b
+Format du fichier -f (une ligne par équipement, # = commentaire) :
+    label;host;utilisateur[;port]
 
-Le mot de passe peut être fourni via la variable d'environnement BIGIP_PASSWORD.
+Le mot de passe est demandé une fois (ou variable d'environnement BIGIP_PASSWORD).
+
+Dépendance : paramiko  (pip install paramiko)
 """
 
 import argparse
 import getpass
-import hashlib
 import json
 import os
 import re
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-try:
-    import paramiko
-except ImportError:
-    print("[ERREUR] paramiko requis : pip install paramiko")
-    sys.exit(2)
+import paramiko
 
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
+REPERTOIRE_CAPTURES = "captures"
+TIMEOUT_SSH = 30
+TIMEOUT_COMMANDE = 120
 
-TIMEOUT_CONNEXION = 15      # secondes
-TIMEOUT_COMMANDE = 180      # secondes
-REPERTOIRE_SORTIE = "captures"
-
-# (fichier de sortie, commande tmsh)
+# /*/* = toutes les partitions (sans cela, seule /Common est retournée)
 COMMANDES_TMSH = [
-    ("state_virtual.txt", "show ltm virtual field-fmt"),
-    ("state_pool.txt", "show ltm pool /*/* members field-fmt"),
-    ("state_node.txt", "show ltm node field-fmt"),
+    ("state_virtual.txt", "show ltm virtual /*/* field-fmt"),
+    ("state_pool.txt",    "show ltm pool /*/* members field-fmt"),
+    ("state_node.txt",    "show ltm node /*/* field-fmt"),
 ]
 
 
-# --------------------------------------------------------------------------- #
-# Utilitaires
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------- SSH
 
-def sha256_texte(texte: str) -> str:
-    return hashlib.sha256(texte.encode("utf-8", errors="replace")).hexdigest()
-
-
-def demander_phase() -> str:
-    while True:
-        rep = input("Phase de la capture [before/after] : ").strip().lower()
-        if rep in ("before", "after"):
-            return rep
-        print("  Réponse invalide, tapez 'before' ou 'after'.")
+def executer_tmsh(client: paramiko.SSHClient, commande: str) -> str:
+    """Exécute une commande tmsh. Passe par 'tmsh -c' pour être indépendant
+    du shell de connexion (bash ou tmsh)."""
+    cmd = "tmsh -c '{}'".format(commande.replace("'", "'\\''"))
+    _, stdout, stderr = client.exec_command(cmd, timeout=TIMEOUT_COMMANDE)
+    sortie = stdout.read().decode("utf-8", errors="replace")
+    erreur = stderr.read().decode("utf-8", errors="replace")
+    if not sortie.strip() and erreur.strip():
+        raise RuntimeError("tmsh : {}".format(erreur.strip()))
+    return sortie
 
 
-def lire_fichier_equipements(chemin: str) -> List[Tuple[str, str]]:
-    """Lit 'ip [label]' par ligne ; '#' = commentaire."""
-    equipements: List[Tuple[str, str]] = []
-    with open(chemin, "r", encoding="utf-8") as f:
-        for ligne in f:
-            ligne = ligne.split("#", 1)[0].strip()
-            if not ligne:
-                continue
-            parties = ligne.split()
-            hote = parties[0]
-            label = parties[1] if len(parties) > 1 else hote
-            equipements.append((hote, label))
-    return equipements
-
-
-# --------------------------------------------------------------------------- #
-# SSH
-# --------------------------------------------------------------------------- #
-
-def ouvrir_connexion(hote: str, port: int, utilisateur: str, mot_de_passe: str) -> paramiko.SSHClient:
+def connecter(host: str, port: int, user: str, password: str) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=hote,
-        port=port,
-        username=utilisateur,
-        password=mot_de_passe,
-        timeout=TIMEOUT_CONNEXION,
-        banner_timeout=TIMEOUT_CONNEXION,
-        auth_timeout=TIMEOUT_CONNEXION,
-        look_for_keys=False,
-        allow_agent=False,
-    )
+    client.connect(host, port=port, username=user, password=password,
+                   timeout=TIMEOUT_SSH, look_for_keys=False, allow_agent=False)
     return client
 
 
-def executer(client: paramiko.SSHClient, commande: str, timeout: int = TIMEOUT_COMMANDE) -> Tuple[int, str, str]:
-    _stdin, stdout, stderr = client.exec_command(commande, timeout=timeout)
-    sortie = stdout.read().decode("utf-8", errors="replace")
-    erreur = stderr.read().decode("utf-8", errors="replace")
-    code = stdout.channel.recv_exit_status()
-    return code, sortie, erreur
+# ------------------------------------------------------------- Parseurs
 
-
-def detecter_shell(client: paramiko.SSHClient) -> str:
-    """Retourne 'tmsh' si le shell de connexion est tmsh, sinon 'bash'."""
-    code, sortie, _err = executer(client, "show sys version", timeout=30)
-    if code == 0 and "Sys::Version" in sortie:
-        return "tmsh"
-    return "bash"
-
-
-def construire_commande(shell: str, cmd_tmsh: str) -> str:
-    """Adapte la commande au shell de connexion (guillemets simples : '*' protégé)."""
-    if shell == "bash":
-        return "tmsh -c '{}'".format(cmd_tmsh)
-    return cmd_tmsh
-
-
-# --------------------------------------------------------------------------- #
-# Parsing
-# --------------------------------------------------------------------------- #
-
-def _extraire_valeur(bloc: str, champ: str) -> Optional[str]:
-    m = re.search(r"^\s*{}\s+(\S+)".format(re.escape(champ)), bloc, re.MULTILINE)
-    return m.group(1) if m else None
-
-
-def _decouper_blocs(texte: str, prefixe: str) -> List[Tuple[str, str]]:
-    """Découpe 'prefixe <nom> {' ... '}' de premier niveau en (nom, contenu)."""
-    blocs: List[Tuple[str, str]] = []
-    motif = re.compile(r"^{}\s+(\S+)\s*\{{".format(re.escape(prefixe)), re.MULTILINE)
-    for m in motif.finditer(texte):
-        nom = m.group(1)
-        debut = m.end()
-        profondeur = 1
-        i = debut
-        while i < len(texte) and profondeur > 0:
-            if texte[i] == "{":
-                profondeur += 1
-            elif texte[i] == "}":
-                profondeur -= 1
-            i += 1
-        blocs.append((nom, texte[debut:i - 1]))
+def decouper_blocs(texte: str, prefixe: str) -> List[List[str]]:
+    """Découpe une sortie 'field-fmt' en blocs, un par objet.
+    Un bloc commence par une ligne '<prefixe> <nom>' (ex. 'ltm virtual /Common/vs')
+    et se termine par '}' au niveau 0. Gère les sous-blocs imbriqués."""
+    blocs, courant, profondeur = [], None, 0
+    for ligne in texte.splitlines():
+        brut = ligne.strip()
+        if courant is None:
+            if brut.startswith(prefixe + " ") and brut.endswith("{"):
+                courant = [brut]
+                profondeur = 1
+            continue
+        courant.append(brut)
+        profondeur += brut.count("{") - brut.count("}")
+        if profondeur <= 0:
+            blocs.append(courant)
+            courant, profondeur = None, 0
     return blocs
 
 
-def parser_virtuals(texte: str) -> List[Dict[str, Optional[str]]]:
-    resultat = []
-    for nom, bloc in _decouper_blocs(texte, "ltm virtual"):
-        resultat.append({
-            "nom": nom,
-            "destination": _extraire_valeur(bloc, "destination"),
-            "disponibilite": _extraire_valeur(bloc, "status.availability-state"),
-            "etat": _extraire_valeur(bloc, "status.enabled-state"),
-            "raison": _extraire_valeur(bloc, "status.status-reason"),
-        })
-    return resultat
+def nom_du_bloc(bloc: List[str], prefixe: str) -> str:
+    entete = bloc[0][len(prefixe):].strip()
+    return entete.rstrip("{").strip()
 
 
-def parser_pools(texte: str) -> List[Dict[str, object]]:
-    resultat = []
-    for nom, bloc in _decouper_blocs(texte, "ltm pool"):
-        membres = []
-        m = re.search(r"^\s*members\s*\{", bloc, re.MULTILINE)
+def valeur(bloc: List[str], cle: str) -> Optional[str]:
+    """Première valeur d'une clé simple 'cle valeur' dans le bloc."""
+    motif = re.compile(r"^{}\s+(.+)$".format(re.escape(cle)))
+    for ligne in bloc:
+        m = motif.match(ligne)
         if m:
-            debut = m.end()
-            profondeur = 1
-            i = debut
-            while i < len(bloc) and profondeur > 0:
-                if bloc[i] == "{":
-                    profondeur += 1
-                elif bloc[i] == "}":
-                    profondeur -= 1
-                i += 1
-            zone = bloc[debut:i - 1]
-            for adresse, contenu in re.findall(r"(\S+:\S+)\s*\{((?:[^{}]|\{[^{}]*\})*)\}", zone):
-                membres.append({
-                    "membre": adresse,
-                    "disponibilite": _extraire_valeur(contenu, "status.availability-state"),
-                    "etat": _extraire_valeur(contenu, "status.enabled-state"),
-                    "raison": _extraire_valeur(contenu, "status.status-reason"),
-                })
-        resultat.append({
-            "nom": nom,
-            "disponibilite": _extraire_valeur(bloc, "status.availability-state"),
-            "etat": _extraire_valeur(bloc, "status.enabled-state"),
-            "membres": membres,
-        })
+            return m.group(1).strip()
+    return None
+
+
+def extraire_statut(bloc: List[str]) -> Dict[str, Optional[str]]:
+    return {
+        "disponibilite": valeur(bloc, "status.availability-state"),
+        "etat": valeur(bloc, "status.enabled-state"),
+        "raison": valeur(bloc, "status.status-reason"),
+    }
+
+
+def parser_virtuals(texte: str) -> Dict[str, dict]:
+    resultat = {}
+    for bloc in decouper_blocs(texte, "ltm virtual"):
+        nom = nom_du_bloc(bloc, "ltm virtual")
+        entree = extraire_statut(bloc)
+        entree["destination"] = valeur(bloc, "destination")
+        resultat[nom] = entree
     return resultat
 
 
-def parser_nodes(texte: str) -> List[Dict[str, Optional[str]]]:
-    resultat = []
-    for nom, bloc in _decouper_blocs(texte, "ltm node"):
-        resultat.append({
-            "nom": nom,
-            "adresse": _extraire_valeur(bloc, "addr"),
-            "disponibilite": _extraire_valeur(bloc, "status.availability-state"),
-            "etat": _extraire_valeur(bloc, "status.enabled-state"),
-            "raison": _extraire_valeur(bloc, "status.status-reason"),
-        })
+def parser_nodes(texte: str) -> Dict[str, dict]:
+    resultat = {}
+    for bloc in decouper_blocs(texte, "ltm node"):
+        nom = nom_du_bloc(bloc, "ltm node")
+        entree = extraire_statut(bloc)
+        entree["adresse"] = valeur(bloc, "addr")
+        resultat[nom] = entree
     return resultat
 
 
-# --------------------------------------------------------------------------- #
-# Capture d'un équipement
-# --------------------------------------------------------------------------- #
+def parser_pools(texte: str):
+    """Retourne (pools, membres).
+    pools   : {nom_pool: {disponibilite, etat}}
+    membres : {'nom_pool / adresse:port': {disponibilite, etat, raison}}"""
+    pools, membres = {}, {}
+    for bloc in decouper_blocs(texte, "ltm pool"):
+        nom_pool = nom_du_bloc(bloc, "ltm pool")
+        pools[nom_pool] = extraire_statut(bloc)
+        pools[nom_pool].pop("raison", None)
 
-def capturer_equipement(hote: str, label: str, phase: str, utilisateur: str,
-                        mot_de_passe: str, port: int, racine: Path) -> bool:
-    print("\n=== {} ({}) [{}] ===".format(label, hote, phase))
-    debut_global = time.time()
+        # Membres : sous-blocs 'members { <nom> { ... } }'
+        dans_membres, profondeur_membres = False, 0
+        membre_nom, membre_lignes, profondeur_membre = None, [], 0
+        for ligne in bloc[1:]:
+            if not dans_membres:
+                if ligne.startswith("members") and ligne.endswith("{"):
+                    dans_membres, profondeur_membres = True, 1
+                continue
+            if membre_nom is None:
+                if ligne.endswith("{") and not ligne.startswith("}"):
+                    membre_nom = ligne.rstrip("{").strip()
+                    membre_lignes, profondeur_membre = [], 1
+                else:
+                    profondeur_membres += ligne.count("{") - ligne.count("}")
+                    if profondeur_membres <= 0:
+                        dans_membres = False
+                continue
+            membre_lignes.append(ligne)
+            profondeur_membre += ligne.count("{") - ligne.count("}")
+            if profondeur_membre <= 0:
+                cle = "{} / {}".format(nom_pool, membre_nom)
+                membres[cle] = extraire_statut(membre_lignes)
+                membre_nom = None
+    return pools, membres
 
-    try:
-        client = ouvrir_connexion(hote, port, utilisateur, mot_de_passe)
-    except Exception as exc:
-        print("  [ERREUR] Connexion impossible : {}".format(exc))
-        return False
 
+# ----------------------------------------------------------- Capture
+
+def capturer_equipement(label: str, host: str, port: int, user: str,
+                        password: str, phase: str, racine: Path) -> Path:
     horodatage = datetime.now().strftime("%Y%m%d_%H%M%S")
     dossier = racine / "{}_{}_{}".format(label, phase, horodatage)
     dossier.mkdir(parents=True, exist_ok=True)
 
-    meta: Dict[str, object] = {
-        "hote": hote,
-        "label": label,
-        "phase": phase,
-        "horodatage": horodatage,
-        "fichiers": {},
-    }
-    contenus: Dict[str, str] = {}
-    succes = True
-
+    client = connecter(host, port, user, password)
     try:
-        shell = detecter_shell(client)
-        meta["shell"] = shell
-        print("  Shell détecté : {}".format(shell))
-
-        for nom_fichier, cmd_tmsh in COMMANDES_TMSH:
-            commande = construire_commande(shell, cmd_tmsh)
-            t0 = time.time()
-            try:
-                code, sortie, erreur = executer(client, commande)
-            except Exception as exc:
-                print("  [ERREUR] '{}' : {}".format(cmd_tmsh, exc))
-                succes = False
-                continue
-            duree = round(time.time() - t0, 2)
-
-            if code != 0:
-                print("  [ERREUR] '{}' (code {}) : {}".format(cmd_tmsh, code, (erreur or sortie).strip()))
-                succes = False
-                continue
-
-            (dossier / nom_fichier).write_text(sortie, encoding="utf-8")
-            contenus[nom_fichier] = sortie
-            meta["fichiers"][nom_fichier] = {
-                "commande": cmd_tmsh,
-                "octets": len(sortie.encode("utf-8", errors="replace")),
-                "sha256": sha256_texte(sortie),
-                "duree_s": duree,
-            }
-            print("  OK  {:<20} {:>8} octets  ({} s)".format(nom_fichier, len(sortie), duree))
+        sorties = {}
+        for fichier, commande in COMMANDES_TMSH:
+            texte = executer_tmsh(client, commande)
+            (dossier / fichier).write_text(texte, encoding="utf-8")
+            sorties[fichier] = texte
+            print("  [OK] {:<20} {} octets".format(fichier, len(texte)))
     finally:
         client.close()
 
-    synthese = {
-        "virtuals": parser_virtuals(contenus.get("state_virtual.txt", "")),
-        "pools": parser_pools(contenus.get("state_pool.txt", "")),
-        "nodes": parser_nodes(contenus.get("state_node.txt", "")),
+    virtuals = parser_virtuals(sorties["state_virtual.txt"])
+    pools, membres = parser_pools(sorties["state_pool.txt"])
+    nodes = parser_nodes(sorties["state_node.txt"])
+
+    resume = {
+        "label": label,
+        "host": host,
+        "phase": phase,
+        "horodatage": horodatage,
+        "ltm_virtual": virtuals,
+        "ltm_pool": pools,
+        "ltm_pool_member": membres,
+        "ltm_node": nodes,
     }
     (dossier / "state_summary.json").write_text(
-        json.dumps(synthese, indent=2, ensure_ascii=False), encoding="utf-8")
+        json.dumps(resume, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    meta["duree_totale_s"] = round(time.time() - debut_global, 2)
-    meta["succes"] = succes
-    (dossier / "_meta_state.json").write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    print("  Résumé : {} virtual(s), {} pool(s), {} membre(s), {} node(s)".format(
+        len(virtuals), len(pools), len(membres), len(nodes)))
 
-    print("  Synthèse : {} virtuals, {} pools, {} nodes".format(
-        len(synthese["virtuals"]), len(synthese["pools"]), len(synthese["nodes"])))
-    print("  Dossier  : {}".format(dossier))
-    return succes
+    # Contrôle : combien d'objets hors /Common ?
+    hors_common = sum(1 for n in virtuals if not n.startswith("/Common/"))
+    print("  Dont {} virtual(s) hors /Common".format(hors_common))
+    return dossier
 
 
-# --------------------------------------------------------------------------- #
-# Programme principal
-# --------------------------------------------------------------------------- #
+# ------------------------------------------------------------- Entrée
+
+def lire_fichier_equipements(chemin: str):
+    equipements = []
+    for numero, ligne in enumerate(Path(chemin).read_text(encoding="utf-8").splitlines(), 1):
+        ligne = ligne.strip()
+        if not ligne or ligne.startswith("#"):
+            continue
+        champs = [c.strip() for c in ligne.split(";")]
+        if len(champs) < 3:
+            print("Ligne {} ignorée (format label;host;user[;port]) : {}".format(numero, ligne))
+            continue
+        port = int(champs[3]) if len(champs) > 3 and champs[3] else 22
+        equipements.append((champs[0], champs[1], champs[2], port))
+    return equipements
+
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Relevé d'état runtime BIG-IP (lecture seule)")
-    parser.add_argument("--host", help="Adresse IP ou nom de l'équipement")
-    parser.add_argument("--label", help="Nom court utilisé pour nommer les fichiers")
-    parser.add_argument("-f", "--file", help="Fichier listant les équipements")
-    parser.add_argument("--phase", choices=["before", "after"], help="Phase de la capture")
-    parser.add_argument("--user", help="Utilisateur SSH")
-    parser.add_argument("--port", type=int, default=22, help="Port SSH (défaut : 22)")
-    parser.add_argument("--output", default=REPERTOIRE_SORTIE, help="Répertoire de sortie")
+    parser = argparse.ArgumentParser(description="Capture de l'état runtime BIG-IP.")
+    parser.add_argument("--phase", required=True, choices=["before", "after"])
+    parser.add_argument("--host")
+    parser.add_argument("--label")
+    parser.add_argument("--user", default="admin")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("-f", "--fichier", help="fichier d'équipements (label;host;user[;port])")
+    parser.add_argument("--captures", default=REPERTOIRE_CAPTURES)
     args = parser.parse_args()
 
-    if args.file:
-        equipements = lire_fichier_equipements(args.file)
-    elif args.host:
-        equipements = [(args.host, args.label or args.host)]
+    if args.fichier:
+        equipements = lire_fichier_equipements(args.fichier)
+    elif args.host and args.label:
+        equipements = [(args.label, args.host, args.user, args.port)]
     else:
-        parser.error("Indiquer --host ou -f")
-        return 2
+        parser.error("Fournir --host et --label, ou -f fichier.")
 
     if not equipements:
-        print("[ERREUR] Aucun équipement à traiter.")
+        print("Aucun équipement à traiter.")
         return 2
 
-    phase = args.phase or demander_phase()
-
-    utilisateur = args.user or input("Utilisateur SSH : ").strip()
-    mot_de_passe = os.environ.get("BIGIP_PASSWORD") or getpass.getpass("Mot de passe : ")
-
-    racine = Path(args.output)
+    password = os.environ.get("BIGIP_PASSWORD") or getpass.getpass("Mot de passe : ")
+    racine = Path(args.captures)
     racine.mkdir(parents=True, exist_ok=True)
 
-    bilan: List[Tuple[str, bool]] = []
-    for hote, label in equipements:
-        ok = capturer_equipement(hote, label, phase, utilisateur, mot_de_passe, args.port, racine)
-        bilan.append((label, ok))
+    erreurs = 0
+    for label, host, user, port in equipements:
+        print("=== {} ({}) - phase {} ===".format(label, host, args.phase))
+        try:
+            dossier = capturer_equipement(label, host, port, user, password,
+                                          args.phase, racine)
+            print("  -> {}".format(dossier))
+        except Exception as exc:  # noqa: BLE001
+            erreurs += 1
+            print("  [ERREUR] {}".format(exc))
 
-    print("\n=== Bilan [{}] ===".format(phase))
-    for label, ok in bilan:
-        print("  {:<30} {}".format(label, "OK" if ok else "ERREUR"))
-    return 0 if all(ok for _l, ok in bilan) else 1
+    return 1 if erreurs else 0
 
 
 if __name__ == "__main__":
