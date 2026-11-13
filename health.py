@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Relevé BIG-IP (lecture seule) via SSH/Paramiko, en parallèle.
 
-Sans -u/--user, demande l’utilisateur SSH (Entrée = admin).
+Sans -u/--user, demande l'utilisateur SSH (Entrée = admin).
+Sans --etat, demande l'état du relevé : 1 = before, 2 = after.
 """
 from __future__ import annotations
 
@@ -126,19 +127,45 @@ def _est_commande_tmsh(commande: str) -> bool:
                        "save", "reset", "run", "help", "exit", "quit"}
 
 
-def executer_commande(client: Any, commande: str, shell: str, timeout: float) -> str:
-    """Exécute une commande tmsh ou Linux selon le shell d'ouverture BIG-IP."""
-    if shell == "tmsh":
-        remote = commande if _est_commande_tmsh(commande) else "run /util bash -c {}".format(shlex.quote(commande))
-    else:
-        remote = "tmsh -q {}".format(commande) if _est_commande_tmsh(commande) else commande
-    stdin, stdout, stderr = client.exec_command(remote, timeout=timeout)
+def _lancer(client: Any, remote: str, timeout: float) -> Tuple[str, str, int]:
+    """Exécute une commande distante, retourne (stdout, stderr, code)."""
+    _stdin, stdout, stderr = client.exec_command(remote, timeout=timeout)
     sortie = stdout.read().decode("utf-8", errors="replace")
     erreur = stderr.read().decode("utf-8", errors="replace").strip()
     code = stdout.channel.recv_exit_status()
-    if code:
-        raise RuntimeError("commande {!r} en échec (code {}): {}".format(commande, code, erreur or sortie.strip()))
-    return sortie
+    return sortie, erreur, code
+
+
+def _erreur_shell(sortie: str, erreur: str) -> bool:
+    """Détecte l'erreur typique d'un mauvais choix de shell (tmsh vs bash)."""
+    texte = (sortie + " " + erreur).lower()
+    return ("syntax error" in texte and "unexpected argument" in texte) \
+        or "command not found" in texte
+
+
+def executer_commande(client: Any, commande: str, shell: str, timeout: float) -> str:
+    """Exécute une commande tmsh ou Linux selon le shell d'ouverture BIG-IP.
+
+    Si la forme choisie échoue à cause d'une mauvaise détection du shell,
+    la commande est rejouée automatiquement sous l'autre forme."""
+    est_tmsh = _est_commande_tmsh(commande)
+    # Forme "bash" : on préfixe 'tmsh -q'. Forme "tmsh" : commande telle quelle.
+    forme_bash = "tmsh -q {}".format(commande) if est_tmsh else commande
+    forme_tmsh = commande if est_tmsh else "run /util bash -c {}".format(shlex.quote(commande))
+
+    ordre = (forme_bash, forme_tmsh) if shell == "bash" else (forme_tmsh, forme_bash)
+
+    derniere: Tuple[str, str, int] = ("", "", 1)
+    for remote in ordre:
+        sortie, erreur, code = _lancer(client, remote, timeout)
+        derniere = (sortie, erreur, code)
+        if code == 0 and not _erreur_shell(sortie, erreur):
+            return sortie
+        if not _erreur_shell(sortie, erreur):
+            break  # vraie erreur de commande : inutile de changer de forme
+    sortie, erreur, code = derniere
+    raise RuntimeError("commande {!r} en échec (code {}): {}".format(
+        commande, code, erreur or sortie.strip()))
 
 
 def ouvrir_client(host: str, port: int, user: str, password: str, timeout: float) -> Any:
@@ -206,31 +233,36 @@ def _masquer_secret(value: Any, secret: str) -> Any:
 
 
 def _detecter_shell(client: Any, timeout: float) -> str:
-    """Teste echo/$0 puis bash -c; confirme tmsh par show sys version."""
-    probes = ("echo $0", "bash -c 'echo BASHOK'")
-    observed = []
-    for command in probes:
-        try:
-            _stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-            output = stdout.read().decode("utf-8", errors="replace").strip()
-            error = stderr.read().decode("utf-8", errors="replace").strip()
-            status = stdout.channel.recv_exit_status()
-        except Exception:
-            continue
-        observed.append((command, output, error, status))
-        if not status and (output == "BASHOK" or re.search(r"(?:^|/)-?(?:bash|sh)(?:\s|$)", output.lower())):
-            return "bash"
+    """Détecte le shell de connexion : 'bash' ou 'tmsh'.
+
+    Sous tmsh, 'echo' est une commande inconnue (syntax error) ; c'est ce
+    signal qui est utilisé, plutôt que la seule lecture de $0."""
     try:
-        _stdin, stdout, stderr = client.exec_command("show sys version", timeout=timeout)
-        output = stdout.read().decode("utf-8", errors="replace")
-        error = stderr.read().decode("utf-8", errors="replace").strip()
-        status = stdout.channel.recv_exit_status()
-        if status == 0 and (extraire_version(output) or "version" in output.lower()):
+        sortie, erreur, _code = _lancer(client, "echo BASHOK", timeout)
+        if "BASHOK" in sortie and not _erreur_shell(sortie, erreur):
+            return "bash"
+        if _erreur_shell(sortie, erreur):
             return "tmsh"
     except Exception:
         pass
-    detail = observed[-1][1] if observed else "sortie vide"
-    raise RuntimeError("shell distant non reconnu (echo/bash et confirmation tmsh échoués): {}".format(detail or "sortie vide"))
+
+    # Confirmation par une commande tmsh native
+    try:
+        sortie, erreur, code = _lancer(client, "show sys version", timeout)
+        if code == 0 and "version" in sortie.lower():
+            return "tmsh"
+    except Exception:
+        pass
+
+    # Dernier essai : tmsh préfixé (compte bash)
+    try:
+        sortie, erreur, code = _lancer(client, "tmsh -q show sys version", timeout)
+        if code == 0 and "version" in sortie.lower():
+            return "bash"
+    except Exception:
+        pass
+
+    raise RuntimeError("shell distant non reconnu (ni bash ni tmsh)")
 
 
 def _champ_incomplet(cpu: Dict[str, Any], mem: Dict[str, Any], con: Dict[str, Any], version: Optional[str]) -> List[str]:
@@ -293,6 +325,21 @@ def _statistiques(echantillons: List[Dict[str, Any]]) -> Dict[str, Any]:
     return resultat
 
 
+def _statut_erreur(exc: Exception) -> str:
+    message = str(exc)
+    typ = type(exc).__name__.lower()
+    msg = message.lower()
+    if "authentication" in typ or "auth" in msg or "authentication failed" in msg:
+        return "AUTH_REFUSEE"
+    if "timeout" in typ or "timed out" in msg or "timeout" in msg:
+        return "TIMEOUT"
+    if "paramiko" in msg and "manquant" in msg:
+        return "DEPENDANCE_MANQUANTE"
+    if isinstance(exc, argparse.ArgumentTypeError):
+        return "HOTE_INVALIDE"
+    return "ERREUR_SSH"
+
+
 def collecter(equipement: str, user: str, password: str, timeout: float,
               duree: float = 0, intervalle: float = 10, etat: str = "before") -> Dict[str, Any]:
     host, port = analyser_hoteport(equipement)
@@ -343,7 +390,7 @@ def collecter(equipement: str, user: str, password: str, timeout: float,
                     if parsed["version"]:
                         resultat["version"] = parsed["version"]
                 else:
-                    rec["erreur"] = "aucune métrique numérique analysable"
+                    rec["erreur"] = rec.get("erreur") or "aucune métrique numérique analysable"
                 if getattr(collecter, "inclure_brut", False) and numero == 1:
                     rec["brut"] = brut
             except Exception as exc:
@@ -409,20 +456,6 @@ def collecter(equipement: str, user: str, password: str, timeout: float,
             except Exception:
                 pass
 
-def _statut_erreur(exc: Exception) -> str:
-    message = str(exc)
-    typ = type(exc).__name__.lower()
-    msg = message.lower()
-    if "authentication" in typ or "auth" in msg or "authentication failed" in msg:
-        return "AUTH_REFUSEE"
-    if "timeout" in typ or "timed out" in msg or "timeout" in msg:
-        return "TIMEOUT"
-    if "paramiko" in msg and "manquant" in msg:
-        return "DEPENDANCE_MANQUANTE"
-    if isinstance(exc, argparse.ArgumentTypeError):
-        return "HOTE_INVALIDE"
-    return "ERREUR_SSH"
-
 
 def lire_hotes(positionnels: Iterable[str], fichier: Optional[str]) -> List[str]:
     hotes = list(positionnels)
@@ -452,15 +485,18 @@ def afficher_tableau(resultats: List[Dict[str, Any]], duree: float = 0, interval
     count_text = str(counts[0]) if len(counts) == 1 and counts else ("/".join(map(str, counts)) if counts else "0")
     print("Fenêtre: {} s | intervalle: {} s | échantillons/équipement: {} (valides par métrique)".format(
         duree, intervalle, count_text))
+
     def cellule(r: Dict[str, Any], metric: str, suffix: str = "") -> str:
         st = r.get("statistiques", {}).get(metric, {})
         avg, lo, hi = st.get("moyenne"), st.get("min"), st.get("max")
         if avg is None:
             return "n/d (0)"
+
         def compact(v: Any) -> str:
             return "{:.1f}".format(v).rstrip("0").rstrip(".")
         return (compact(avg) + suffix + " (" + compact(lo) + "–" + compact(hi) + suffix + ";" +
                 str(st.get("echantillons_valides", 0)) + ")")
+
     lignes = []
     for r in resultats:
         lignes.append([
@@ -470,7 +506,8 @@ def afficher_tableau(resultats: List[Dict[str, Any]], duree: float = 0, interval
             cellule(r, "nouvelles_connexions_client_s"), cellule(r, "nouvelles_connexions_server_s"),
         ])
     headers = ["ÉQUIPEMENT", "USER", "STATUT", "CPU%", "TMM%", "HOST%", "ACT", "CLI/s", "SRV/s"]
-    widths = [max(len(headers[i]), *(len(line[i]) for line in lignes)) if lignes else len(headers[i]) for i in range(len(headers))]
+    widths = [max(len(headers[i]), *(len(line[i]) for line in lignes)) if lignes else len(headers[i])
+              for i in range(len(headers))]
     print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
     print("  ".join("─" * widths[i] for i in range(len(headers))))
     for line in lignes:
@@ -479,25 +516,31 @@ def afficher_tableau(resultats: List[Dict[str, Any]], duree: float = 0, interval
         for warning in r.get("avertissements", []):
             print("{}: {}".format(r.get("equipement"), warning), file=sys.stderr)
 
+
 def normaliser_etat(value: str) -> str:
+    """Accepte 1/2, before/after, b/a, avant/apres."""
     value = value.strip().lower()
-    aliases = {"b": "before", "a": "after"}
+    aliases = {"1": "before", "b": "before", "avant": "before",
+               "2": "after", "a": "after", "apres": "after", "après": "after"}
     value = aliases.get(value, value)
     if value not in ("before", "after"):
-        raise argparse.ArgumentTypeError("l'état doit être before ou after")
+        raise argparse.ArgumentTypeError("l'état doit être 1/before ou 2/after")
     return value
 
 
 def demander_etat() -> str:
+    print("Quel est l'état de ce relevé ?")
+    print("  1) before (avant l'intervention)")
+    print("  2) after  (après l'intervention)")
     while True:
         try:
-            value = input("État [before/after] : ")
+            value = input("Choix [1/2] : ")
         except EOFError as exc:
             raise RuntimeError("aucun état fourni") from exc
         try:
             return normaliser_etat(value)
         except argparse.ArgumentTypeError:
-            print("Valeur invalide. Saisir before ou after (b/a).", file=sys.stderr)
+            print("Valeur invalide. Saisir 1 (before) ou 2 (after).", file=sys.stderr)
 
 
 def construire_parser() -> argparse.ArgumentParser:
@@ -506,13 +549,13 @@ def construire_parser() -> argparse.ArgumentParser:
     parser.add_argument("-f", "--fichier", help="fichier de liste d'hôtes (un par ligne, # commentaires)")
     parser.add_argument("-u", "--user", default=None, help="utilisateur SSH (sans cette option : prompt interactif, défaut admin)")
     parser.add_argument("-w", "--workers", type=int, default=4, help="nombre de connexions parallèles (défaut: 4)")
-    parser.add_argument("--etat", type=normaliser_etat, choices=("before", "after"),
-                        help="état du relevé : before ou after")
+    parser.add_argument("--etat", type=normaliser_etat,
+                        help="état du relevé : 1/before ou 2/after (sans cette option : prompt interactif)")
     parser.add_argument("-j", "--json", dest="json_path", nargs="?", const="",
-                        help="chemin de sortie JSON (sans valeur : sante_bigip_<état>.json")
+                        help="chemin de sortie JSON (sans valeur : sante_bigip_<état>.json)")
     parser.add_argument("--raw", action="store_true", help="inclure les sorties tmsh brutes dans le JSON")
     parser.add_argument("--timeout", type=float, default=10.0, help="timeout SSH/commande en secondes (défaut: 10)")
-    parser.add_argument("--duree", type=float, default=60, help="fenêtre d’échantillonnage en secondes (défaut: 60; 0 = relevé unique)")
+    parser.add_argument("--duree", type=float, default=60, help="fenêtre d'échantillonnage en secondes (défaut: 60; 0 = relevé unique)")
     parser.add_argument("--intervalle", type=float, default=10, help="secondes entre échantillons (défaut: 10)")
     return parser
 
@@ -543,19 +586,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     _STOP_EVENT.clear()
     resultats: List[Optional[Dict[str, Any]]] = [None] * len(hotes)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futurs = {pool.submit(collecter, hote, user, password, args.timeout, args.duree, args.intervalle, etat): index for index, hote in enumerate(hotes)}
+        futurs = {pool.submit(collecter, hote, user, password, args.timeout, args.duree,
+                              args.intervalle, etat): index for index, hote in enumerate(hotes)}
         try:
-          for futur in concurrent.futures.as_completed(futurs):
-            index = futurs[futur]
-            try:
-                resultats[index] = futur.result()
-            except Exception as exc:  # garde-fou; une panne isolée ne bloque pas le lot
-                resultats[index] = {"equipement": hotes[index], "statut": _statut_erreur(exc), "erreur": str(exc),
-                                    "horodatage": datetime.now().astimezone().isoformat(timespec="seconds"),
-                                    "user": user, "etat": etat, "version": None, "cpu": {"coeurs": {}, "moyenne_1min": None},
-                                    "memoire": {"tmm_total": None, "tmm_utilisee": None, "tmm_pct": None,
-                                                "host_total": None, "host_utilisee": None, "host_pct": None},
-                                    "connexions": {}}
+            for futur in concurrent.futures.as_completed(futurs):
+                index = futurs[futur]
+                try:
+                    resultats[index] = futur.result()
+                except Exception as exc:  # garde-fou; une panne isolée ne bloque pas le lot
+                    resultats[index] = {
+                        "equipement": hotes[index], "statut": _statut_erreur(exc), "erreur": str(exc),
+                        "horodatage": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "user": user, "etat": etat, "version": None,
+                        "cpu": {"coeurs": {}, "moyenne_1min": None},
+                        "memoire": {"tmm_total": None, "tmm_utilisee": None, "tmm_pct": None,
+                                    "host_total": None, "host_utilisee": None, "host_pct": None},
+                        "connexions": {}}
         except KeyboardInterrupt:
             _STOP_EVENT.set()
             print("Interruption demandée: arrêt des échantillonnages en cours…", file=sys.stderr)
