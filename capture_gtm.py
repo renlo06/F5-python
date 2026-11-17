@@ -145,9 +145,18 @@ def _nettoyer_secret(texte: str, secret: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _tmsh(client: Any, shell: str, commande: str) -> str:
-    """Exécute une commande tmsh en lecture seule et renvoie sa sortie."""
-    cmd = adapter_commande_bash("tmsh -q {}".format(commande), shell) \
-        if shell == "bash" else "tmsh -q {}".format(commande)
+    """Exécute une commande tmsh en lecture seule et renvoie sa sortie.
+
+    - Shell 'tmsh' : la commande est envoyée directement (pas de préfixe 'tmsh').
+    - Shell 'bash' : on appelle le binaire tmsh explicitement.
+    """
+    if shell == "bash":
+        cmd = "tmsh -q {}".format(commande)
+    elif shell == "tmsh":
+        cmd = "-q {}".format(commande)
+    else:
+        raise ValueError("shell non pris en charge : {}".format(shell))
+
     out, err, rc = run(client, cmd, timeout=180)
     if rc != 0:
         raise RuntimeError("commande '{}' en échec : {}".format(
