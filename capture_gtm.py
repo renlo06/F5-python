@@ -88,27 +88,30 @@ def ouvrir_connexion(hote, port, utilisateur, mdp):
 
 
 def executer(client, commande, shell_mode):
-    """Exécute une commande tmsh, en lecture seule, et renvoie sa sortie."""
+    """Exécute une commande tmsh en lecture seule et renvoie sa sortie.
+
+    shell_mode :
+      - "tmsh" : la session ouvre directement tmsh, on envoie la commande seule
+      - "bash" ou "auto" : appel explicite via tmsh
+    """
     if shell_mode == "tmsh":
-        cmd = "tmsh {}".format(commande)
-    elif shell_mode == "bash":
-        cmd = "bash -c 'tmsh {}'".format(commande)
+        cmd = commande
     else:
         cmd = "tmsh {}".format(commande)
 
     _, stdout, stderr = client.exec_command(cmd, timeout=120)
     sortie = stdout.read().decode("utf-8", errors="replace")
     erreur = stderr.read().decode("utf-8", errors="replace")
-    if erreur.strip() and not sortie.strip():
+
+    if not sortie.strip() and erreur.strip():
         return "ERREUR : {}".format(erreur.strip())
     return sortie
 
 
 # ---------------------------------------------------------------------------
-# Parsing de la sortie tmsh
+# Parsing de la sortie tmsh (accolades imbriquées)
 # ---------------------------------------------------------------------------
 
-# Entrées de premier niveau, avec ou sans indentation ni préfixe "gtm"/"ltm"
 RE_OBJET = re.compile(
     r"^[ \t]*(?:ltm\s+|gtm\s+)?(wideip|pool|server)\s+(\S+)\s*\{",
     re.MULTILINE,
@@ -116,7 +119,7 @@ RE_OBJET = re.compile(
 
 
 def _bloc(texte, pos_accolade):
-    """Renvoie le contenu entre l'accolade ouvrante située à pos_accolade et son fermeture."""
+    """Renvoie le contenu entre l'accolade ouvrante à pos_accolade et son fermant."""
     profondeur = 0
     for i in range(pos_accolade, len(texte)):
         c = texte[i]
@@ -173,89 +176,75 @@ def construire_arborescence(sortie_wideip, sortie_pool):
     lignes.append("")
 
     if not wideips:
-        lignes.append("(aucun WideIP trouvé)")
-        if sortie_wideip.strip():
-            lignes.append("Début de la sortie reçue pour diagnostic :")
-            lignes.append(sortie_wideip[:500])
+        lignes.append("Aucun WideIP trouvé. Voir gtm_wideip_<etat>.txt.")
         return "\n".join(lignes) + "\n"
 
-    for i, (nom_wip, bloc_wip) in enumerate(sorted(wideips.items())):
-        dernier_wip = (i == len(wideips) - 1)
-        branche_wip = "└── " if dernier_wip else "├── "
-        lignes.append("{}WideIP : {}".format(branche_wip, nom_wip))
-        prefixe_wip = "    " if dernier_wip else "│   "
-
-        noms_pools = pools_du_wideip(bloc_wip)
+    for nom_wideip, bloc_wideip in sorted(wideips.items()):
+        lignes.append("WideIP : {}".format(nom_wideip))
+        noms_pools = pools_du_wideip(bloc_wideip)
         if not noms_pools:
-            lignes.append("{}└── (aucun pool)".format(prefixe_wip))
+            lignes.append("  └── (aucun pool référencé)")
+            lignes.append("")
             continue
 
-        for j, nom_pool in enumerate(noms_pools):
-            dernier_pool = (j == len(noms_pools) - 1)
-            branche_pool = "└── " if dernier_pool else "├── "
-            prefixe_pool = prefixe_wip + ("    " if dernier_pool else "│   ")
+        for i, nom_pool in enumerate(noms_pools):
+            dernier_pool = (i == len(noms_pools) - 1)
+            branche = "└── " if dernier_pool else "├── "
+            prefixe_pool = "    " if dernier_pool else "│   "
+            lignes.append("  {}Pool : {}".format(branche, nom_pool))
 
             bloc_pool = pools.get(nom_pool)
             if bloc_pool is None:
-                lignes.append("{}{}Pool : {} (introuvable dans list gtm pool)".format(
-                    prefixe_wip, branche_pool, nom_pool))
+                lignes.append("  {}  └── (pool non trouvé dans la capture)".format(prefixe_pool))
                 continue
 
-            lignes.append("{}{}Pool : {}".format(prefixe_wip, branche_pool, nom_pool))
             membres = membres_du_pool(bloc_pool)
             if not membres:
-                lignes.append("{}└── (aucun pool member)".format(prefixe_pool))
+                lignes.append("  {}  └── (aucun pool member)".format(prefixe_pool))
                 continue
 
-            for k, membre in enumerate(membres):
-                dernier_membre = (k == len(membres) - 1)
+            for j, membre in enumerate(membres):
+                dernier_membre = (j == len(membres) - 1)
                 branche_m = "└── " if dernier_membre else "├── "
-                lignes.append("{}{}Pool member : {}".format(
+                lignes.append("  {}  {}Pool member : {}".format(
                     prefixe_pool, branche_m, membre))
+        lignes.append("")
 
     return "\n".join(lignes) + "\n"
 
 
 # ---------------------------------------------------------------------------
-# Écriture des fichiers de capture
+# Capture d'un équipement
 # ---------------------------------------------------------------------------
 
 def capturer_equipement(hote, args, utilisateur, mdp, etat, horodatage):
-    """Capture la configuration GTM d'un équipement et écrit les fichiers."""
+    """Capture toutes les commandes GTM d'un équipement et écrit les fichiers."""
     dossier = os.path.join(args.sortie, hote)
     os.makedirs(dossier, exist_ok=True)
-    print("[*] {} : connexion...".format(hote))
 
+    print("[*] {} : connexion...".format(hote))
     client = ouvrir_connexion(hote, args.port, utilisateur, mdp)
+
     sorties = {}
     try:
-        for nom, commande in COMMANDES_GTM.items():
-            try:
-                sortie = executer(client, commande, args.shell)
-                statut = "OK"
-            except Exception as e:
-                sortie = "ERREUR : {}".format(e)
-                statut = "ERREUR"
-            sorties[nom] = sortie
-
-            chemin = os.path.join(dossier, "{}_{}.txt".format(nom, etat))
+        for nom_fichier, commande in COMMANDES_GTM.items():
+            print("    - {}".format(commande))
+            sortie = executer(client, commande, args.shell)
+            sorties[nom_fichier] = sortie
+            chemin = os.path.join(dossier, "{}_{}.txt".format(nom_fichier, etat))
             with open(chemin, "w", encoding="utf-8") as f:
-                f.write("# hote={} commande={} etat={} horodatage={}\n".format(
+                f.write("# {} | {} | {} | {}\n\n".format(
                     hote, commande, etat, horodatage))
                 f.write(sortie)
-            print("    [{}] {}".format(statut, commande))
     finally:
         client.close()
 
     chemin_arbo = os.path.join(dossier, "arborescence_gtm_{}.txt".format(etat))
-    arbo = construire_arborescence(
-        sorties.get("gtm_wideip", ""),
-        sorties.get("gtm_pool", ""),
-    )
     with open(chemin_arbo, "w", encoding="utf-8") as f:
-        f.write("# hote={} etat={} horodatage={}\n".format(hote, etat, horodatage))
-        f.write(arbo)
-    print("    [OK] arborescence -> {}".format(os.path.basename(chemin_arbo)))
+        f.write(construire_arborescence(
+            sorties.get("gtm_wideip", ""),
+            sorties.get("gtm_pool", "")))
+    print("[*] {} : arborescence écrite dans {}".format(hote, os.path.basename(chemin_arbo)))
 
 
 # ---------------------------------------------------------------------------
