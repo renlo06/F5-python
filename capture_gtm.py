@@ -2,7 +2,7 @@
 """Capture en lecture seule la configuration GTM (DNS) de plusieurs BIG-IP.
 
 Usage :
-    python3 capture_gtm.py -f equipements.txt [-o sortie] [--shell auto|bash|tmsh]
+    python3 capture_gtm.py -f equipements.txt [-o sortie] [--shell auto|bash|tmsh] [--port 22]
 
 Le script demande :
     - l'utilisateur et le mot de passe
@@ -18,9 +18,24 @@ import argparse
 import getpass
 import os
 import sys
+import traceback
 from datetime import datetime
 
 import paramiko
+
+
+# Commandes GTM en lecture seule : nom du fichier de sortie -> commande tmsh
+COMMANDES_GTM = {
+    "gtm_wideip":        "list gtm wideip",
+    "gtm_pool":          "list gtm pool",
+    "gtm_server":        "list gtm server",
+    "gtm_datacenter":    "list gtm datacenter",
+    "gtm_monitor":       "list gtm monitor",
+    "gtm_prober_pool":   "list gtm prober-pool",
+    "gtm_region":        "list gtm region",
+    "gtm_topology":      "list gtm topology",
+    "gtm_global_setting": "list gtm global-settings",
+}
 
 
 def lire_equipements(chemin):
@@ -70,58 +85,51 @@ def detecter_shell(client):
         out, _, rc = run(client, "echo __SHELL_OK__", timeout=15)
         if rc == 0 and "__SHELL_OK__" in out:
             return "bash"
-    except Exception:
-        pass
+    except Exception as e:
+        print("    (détection shell : {})".format(e))
     return "tmsh"
 
 
 def _tmsh(client, shell, commande):
     """Exécute une commande tmsh en lecture seule et renvoie sa sortie."""
-    if shell == "bash":
-        cmd = "tmsh {}".format(commande)
-    elif shell == "tmsh":
-        cmd = commande
-    else:
-        raise ValueError("shell non pris en charge : {}".format(shell))
-
+    cmd = "tmsh {}".format(commande) if shell == "bash" else commande
     out, err, rc = run(client, cmd, timeout=180)
     if rc != 0 or "Syntax Error" in out:
-        raise RuntimeError("commande '{}' en échec : {}".format(
-            commande, (err or out).strip() or "code {}".format(rc)))
+        raise RuntimeError("commande '{}' : rc={} stderr={} stdout={}".format(
+            cmd, rc, err.strip()[:300], out.strip()[:300]))
+    print("    OK : {} ({} caractères)".format(cmd, len(out)))
     return out
 
 
-COMMANDES_GTM = {
-    "wideip": "list gtm wideip all-properties",
-    "pool_a": "list gtm pool a all-properties",
-    "server": "list gtm server all-properties",
-    "monitor_http": "list gtm monitor http all-properties",
-}
-
-
 def recuperer_gtm(client, shell):
-    """Récupère les objets GTM principaux en lecture seule."""
+    """Récupère toutes les commandes GTM. Renvoie un dict nom -> contenu."""
     resultats = {}
-    for nom, cmd in COMMANDES_GTM.items():
-        resultats[nom] = _tmsh(client, shell, cmd)
+    for nom, commande in COMMANDES_GTM.items():
+        try:
+            resultats[nom] = _tmsh(client, shell, commande)
+        except Exception as e:
+            # Une commande absente (ex. module GTM non licencié) ne bloque pas le reste
+            print("    [!] {} : {}".format(nom, e))
+            resultats[nom] = "ERREUR : {}\n".format(e)
     return resultats
 
 
 def sauvegarder(resultats, dossier):
     os.makedirs(dossier, exist_ok=True)
+    print("    écriture dans : {}".format(os.path.abspath(dossier)))
     for nom, contenu in resultats.items():
         chemin = os.path.join(dossier, "{}.txt".format(nom))
         with open(chemin, "w", encoding="utf-8") as f:
             f.write(contenu)
+        print("    -> {}.txt".format(nom))
 
 
 def capturer_equipement(hote, args, utilisateur, mdp, etat, horodatage):
-    """Capture un équipement dans <sortie>/<etat>_<horodatage>/<hote>/."""
-    print("[*] {} : connexion".format(hote))
+    print("\n[*] {} : connexion".format(hote))
     client = connecter(hote, utilisateur, mdp, args.port)
     try:
         shell = args.shell if args.shell != "auto" else detecter_shell(client)
-        print("[*] {} : shell détecté = {}".format(hote, shell))
+        print("[*] {} : shell = {}".format(hote, shell))
         resultats = recuperer_gtm(client, shell)
         dossier = os.path.join(args.sortie, "{}_{}".format(etat, horodatage), hote)
         sauvegarder(resultats, dossier)
@@ -156,12 +164,16 @@ def main():
     etat = demander_etat()
     horodatage = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    print("[*] {} équipement(s) à traiter, sortie dans : {}".format(
+        len(hotes), os.path.abspath(args.sortie)))
+
     echecs = []
     for hote in hotes:
         try:
             capturer_equipement(hote, args, utilisateur, mdp, etat, horodatage)
         except Exception as e:
             print("[!] {} : erreur : {}".format(hote, e), file=sys.stderr)
+            traceback.print_exc()
             echecs.append(hote)
 
     print("\n[*] Terminé ({}) : {} réussi(s), {} échec(s)".format(
