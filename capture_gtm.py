@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Capture en lecture seule la configuration GTM (DNS) de plusieurs BIG-IP.
+"""Capture en lecture seule la configuration GTM (DNS) de plusieurs BIG-IP,
+et génère une arborescence WideIP -> Pool -> Pool member.
 
 Usage :
     python3 capture_gtm.py -f equipements.txt [-o sortie] [--shell auto|bash|tmsh] [--port 22]
@@ -17,6 +18,7 @@ Format du fichier d'équipements (une adresse par ligne) :
 import argparse
 import getpass
 import os
+import re
 import sys
 import traceback
 from datetime import datetime
@@ -26,17 +28,21 @@ import paramiko
 
 # Commandes GTM en lecture seule : nom du fichier de sortie -> commande tmsh
 COMMANDES_GTM = {
-    "gtm_wideip":        "list gtm wideip",
-    "gtm_pool":          "list gtm pool",
-    "gtm_server":        "list gtm server",
-    "gtm_datacenter":    "list gtm datacenter",
-    "gtm_monitor":       "list gtm monitor",
-    "gtm_prober_pool":   "list gtm prober-pool",
-    "gtm_region":        "list gtm region",
-    "gtm_topology":      "list gtm topology",
+    "gtm_wideip":         "list gtm wideip",
+    "gtm_pool":           "list gtm pool",
+    "gtm_server":         "list gtm server",
+    "gtm_datacenter":     "list gtm datacenter",
+    "gtm_monitor":        "list gtm monitor",
+    "gtm_prober_pool":    "list gtm prober-pool",
+    "gtm_region":         "list gtm region",
+    "gtm_topology":       "list gtm topology",
     "gtm_global_setting": "list gtm global-settings",
 }
 
+
+# ---------------------------------------------------------------------------
+# Lecture du fichier d'équipements et saisie utilisateur
+# ---------------------------------------------------------------------------
 
 def lire_equipements(chemin):
     """Lit le fichier d'équipements et renvoie la liste des hôtes."""
@@ -60,6 +66,10 @@ def demander_etat():
             return "after"
         print("Choix invalide, saisir 1 ou 2.")
 
+
+# ---------------------------------------------------------------------------
+# Connexion SSH et exécution de commandes
+# ---------------------------------------------------------------------------
 
 def connecter(hote, utilisateur, mot_de_passe, port=22):
     client = paramiko.SSHClient()
@@ -108,11 +118,121 @@ def recuperer_gtm(client, shell):
         try:
             resultats[nom] = _tmsh(client, shell, commande)
         except Exception as e:
-            # Une commande absente (ex. module GTM non licencié) ne bloque pas le reste
             print("    [!] {} : {}".format(nom, e))
             resultats[nom] = "ERREUR : {}\n".format(e)
     return resultats
 
+
+# ---------------------------------------------------------------------------
+# Parsing de la sortie tmsh et construction de l'arborescence
+# ---------------------------------------------------------------------------
+
+# Entrées de premier niveau : "gtm wideip /Common/www.example.com {"
+RE_OBJET = re.compile(r"^(?:ltm |gtm )?(wideip|pool|server)\s+(\S+)\s*\{", re.MULTILINE)
+
+
+def _bloc(texte, debut_pos):
+    """Renvoie le texte du bloc { ... } qui commence après debut_pos."""
+    ouverture = texte.find("{", debut_pos)
+    if ouverture == -1:
+        return ""
+    niveau = 0
+    for i in range(ouverture, len(texte)):
+        if texte[i] == "{":
+            niveau += 1
+        elif texte[i] == "}":
+            niveau -= 1
+            if niveau == 0:
+                return texte[ouverture + 1:i]
+    return texte[ouverture + 1:]
+
+
+def parser_objets(texte, type_attendu):
+    """Renvoie {nom: bloc_texte} pour les objets d'un type donné."""
+    objets = {}
+    for m in RE_OBJET.finditer(texte):
+        if m.group(1) == type_attendu:
+            objets[m.group(2)] = _bloc(texte, m.end() - 1)
+    return objets
+
+
+def pools_du_wideip(bloc_wideip):
+    """Renvoie la liste des noms de pools référencés dans un WideIP."""
+    pools = []
+    bloc_pools = re.search(r"pools\s*\{", bloc_wideip)
+    if not bloc_pools:
+        return pools
+    contenu = _bloc(bloc_wideip, bloc_pools.start() + len("pools") )
+    for m in re.finditer(r"^\s*(/?\S+)\s*\{", contenu, re.MULTILINE):
+        pools.append(m.group(1))
+    return pools
+
+
+def membres_du_pool(bloc_pool):
+    """Renvoie la liste des membres (serveur:service) d'un pool."""
+    membres = []
+    bloc_members = re.search(r"members\s*\{", bloc_pool)
+    if not bloc_members:
+        return membres
+    contenu = _bloc(bloc_pool, bloc_members.start() + len("members"))
+    for m in re.finditer(r"^\s*(/?[^\s{}:]+:[^\s{}]+)\s*\{", contenu, re.MULTILINE):
+        membres.append(m.group(1))
+    return membres
+
+
+def construire_arborescence(sortie_wideip, sortie_pool):
+    """Construit le texte de l'arborescence WideIP -> Pool -> Pool member."""
+    wideips = parser_objets(sortie_wideip, "wideip")
+    pools = parser_objets(sortie_pool, "pool")
+
+    lignes = []
+    lignes.append("ARBORESCENCE GTM : WideIP -> Pool -> Pool member")
+    lignes.append("=" * 60)
+
+    if not wideips:
+        lignes.append("(aucun WideIP trouvé)")
+        return "\n".join(lignes) + "\n"
+
+    for i, (nom_wip, bloc_wip) in enumerate(sorted(wideips.items())):
+        dernier_wip = (i == len(wideips) - 1)
+        branche_wip = "└── " if dernier_wip else "├── "
+        lignes.append("{}WideIP : {}".format(branche_wip, nom_wip))
+        prefixe_wip = "    " if dernier_wip else "│   "
+
+        noms_pools = pools_du_wideip(bloc_wip)
+        if not noms_pools:
+            lignes.append("{}└── (aucun pool)".format(prefixe_wip))
+            continue
+
+        for j, nom_pool in enumerate(noms_pools):
+            dernier_pool = (j == len(noms_pools) - 1)
+            branche_pool = "└── " if dernier_pool else "├── "
+            prefixe_pool = prefixe_wip + ("    " if dernier_pool else "│   ")
+
+            bloc_pool = pools.get(nom_pool)
+            if bloc_pool is None:
+                lignes.append("{}{}Pool : {} (introuvable dans list gtm pool)".format(
+                    prefixe_wip, branche_pool, nom_pool))
+                continue
+
+            lignes.append("{}{}Pool : {}".format(prefixe_wip, branche_pool, nom_pool))
+            membres = membres_du_pool(bloc_pool)
+            if not membres:
+                lignes.append("{}└── (aucun pool member)".format(prefixe_pool))
+                continue
+
+            for k, membre in enumerate(membres):
+                dernier_membre = (k == len(membres) - 1)
+                branche_m = "└── " if dernier_membre else "├── "
+                lignes.append("{}{}Pool member : {}".format(
+                    prefixe_pool, branche_m, membre))
+
+    return "\n".join(lignes) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Sauvegarde et orchestration
+# ---------------------------------------------------------------------------
 
 def sauvegarder(resultats, dossier):
     os.makedirs(dossier, exist_ok=True)
@@ -131,17 +251,29 @@ def capturer_equipement(hote, args, utilisateur, mdp, etat, horodatage):
         shell = args.shell if args.shell != "auto" else detecter_shell(client)
         print("[*] {} : shell = {}".format(hote, shell))
         resultats = recuperer_gtm(client, shell)
-        dossier = os.path.join(args.sortie, "{}_{}".format(etat, horodatage), hote)
-        sauvegarder(resultats, dossier)
-        print("[+] {} : capture terminée ({})".format(hote, etat))
-        return True
     finally:
         client.close()
+
+    dossier = os.path.join(args.sortie, "{}_{}".format(etat, horodatage), hote)
+    sauvegarder(resultats, dossier)
+
+    # Arborescence générée à partir des sorties capturées
+    arbre = construire_arborescence(
+        resultats.get("gtm_wideip", ""),
+        resultats.get("gtm_pool", ""),
+    )
+    chemin_arbre = os.path.join(dossier, "arborescence_gtm.txt")
+    with open(chemin_arbre, "w", encoding="utf-8") as f:
+        f.write(arbre)
+    print("    -> arborescence_gtm.txt")
+
+    print("[+] {} : capture terminée ({})".format(hote, etat))
+    return True
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Capture GTM de plusieurs BIG-IP (lecture seule)")
+        description="Capture GTM de plusieurs BIG-IP (lecture seule) + arborescence")
     parser.add_argument("-f", "--fichier", required=True,
                         help="fichier contenant la liste des équipements")
     parser.add_argument("--port", type=int, default=22)
