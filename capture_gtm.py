@@ -4,15 +4,6 @@ et génère une arborescence WideIP -> Pool -> Pool member.
 
 Usage :
     python3 capture_gtm.py -f equipements.txt [-o sortie] [--shell auto|bash|tmsh] [--port 22]
-
-Le script demande :
-    - l'utilisateur et le mot de passe
-    - l'état de la capture : 1 = before, 2 = after
-
-Format du fichier d'équipements (une adresse par ligne) :
-    # commentaire
-    10.0.0.10
-    10.0.0.11
 """
 
 import argparse
@@ -26,7 +17,6 @@ from datetime import datetime
 import paramiko
 
 
-# Commandes GTM en lecture seule : nom du fichier de sortie -> commande tmsh
 COMMANDES_GTM = {
     "gtm_wideip":         "list gtm wideip",
     "gtm_pool":           "list gtm pool",
@@ -41,23 +31,20 @@ COMMANDES_GTM = {
 
 
 # ---------------------------------------------------------------------------
-# Lecture du fichier d'équipements et saisie utilisateur
+# Fichier d'équipements et saisie utilisateur
 # ---------------------------------------------------------------------------
 
 def lire_equipements(chemin):
-    """Lit le fichier d'équipements et renvoie la liste des hôtes."""
     hotes = []
     with open(chemin, "r", encoding="utf-8") as f:
         for ligne in f:
             ligne = ligne.strip()
-            if not ligne or ligne.startswith("#"):
-                continue
-            hotes.append(ligne)
+            if ligne and not ligne.startswith("#"):
+                hotes.append(ligne)
     return hotes
 
 
 def demander_etat():
-    """Demande à l'utilisateur l'état de la capture (before ou after)."""
     while True:
         choix = input("État de la capture : 1) before  2) after  [1/2] : ").strip()
         if choix == "1":
@@ -68,11 +55,10 @@ def demander_etat():
 
 
 # ---------------------------------------------------------------------------
-# Connexion SSH et exécution des commandes
+# Connexion SSH et exécution
 # ---------------------------------------------------------------------------
 
 def ouvrir_connexion(hote, port, utilisateur, mdp):
-    """Ouvre une connexion SSH vers l'équipement."""
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
@@ -87,39 +73,43 @@ def ouvrir_connexion(hote, port, utilisateur, mdp):
     return client
 
 
-def executer(client, commande, shell_mode):
-    """Exécute une commande tmsh en lecture seule et renvoie sa sortie.
-
-    shell_mode :
-      - "tmsh" : la session ouvre directement tmsh, on envoie la commande seule
-      - "bash" ou "auto" : appel explicite via tmsh
-    """
-    if shell_mode == "tmsh":
-        cmd = commande
-    else:
-        cmd = "tmsh {}".format(commande)
-
+def _lancer(client, cmd):
+    """Lance une commande et renvoie (sortie, erreur, code_retour)."""
     _, stdout, stderr = client.exec_command(cmd, timeout=120)
     sortie = stdout.read().decode("utf-8", errors="replace")
     erreur = stderr.read().decode("utf-8", errors="replace")
+    code = stdout.channel.recv_exit_status()
+    return sortie, erreur, code
 
-    if not sortie.strip() and erreur.strip():
-        return "ERREUR : {}".format(erreur.strip())
+
+def detecter_mode(client):
+    """En mode auto, détermine si la session répond à 'tmsh' explicite ou non."""
+    sortie, erreur, code = _lancer(client, "tmsh list sys version")
+    if code == 0 and sortie.strip():
+        return "bash"
+    sortie, erreur, code = _lancer(client, "list sys version")
+    if code == 0 and sortie.strip():
+        return "tmsh"
+    return "bash"
+
+
+def executer(client, commande, mode):
+    """Exécute une commande GTM. Renvoie un texte complet, avec erreur si besoin."""
+    cmd = commande if mode == "tmsh" else "tmsh {}".format(commande)
+    sortie, erreur, code = _lancer(client, cmd)
+    if code != 0 or (not sortie.strip() and erreur.strip()):
+        return ("# ERREUR (code {}) pour la commande : {}\n# {}\n"
+                .format(code, cmd, erreur.strip() or "(pas de message d'erreur)")
+                + sortie)
     return sortie
 
 
 # ---------------------------------------------------------------------------
-# Parsing de la sortie tmsh (accolades imbriquées)
+# Parsing tolérant de la sortie tmsh
 # ---------------------------------------------------------------------------
 
-RE_OBJET = re.compile(
-    r"^[ \t]*(?:ltm\s+|gtm\s+)?(wideip|pool|server)\s+(\S+)\s*\{",
-    re.MULTILINE,
-)
-
-
 def _bloc(texte, pos_accolade):
-    """Renvoie le contenu entre l'accolade ouvrante à pos_accolade et son fermant."""
+    """Contenu entre l'accolade ouvrante à pos_accolade et sa fermante."""
     profondeur = 0
     for i in range(pos_accolade, len(texte)):
         c = texte[i]
@@ -132,37 +122,85 @@ def _bloc(texte, pos_accolade):
     return texte[pos_accolade + 1:]
 
 
+def _lignes_blocs_niveau1(texte):
+    """Renvoie (entête, contenu) pour chaque bloc de premier niveau.
+
+    Un bloc est une ligne 'entête {' suivie de son contenu jusqu'à l'accolade
+    fermante correspondante. Ne dépend ni du préfixe ltm/gtm ni de l'indentation.
+    """
+    resultats = []
+    pos = 0
+    while True:
+        i = texte.find("{", pos)
+        if i == -1:
+            break
+        debut_ligne = texte.rfind("\n", 0, i) + 1
+        entete = texte[debut_ligne:i].strip()
+        bloc = _bloc(texte, i)
+        resultats.append((entete, bloc))
+        # on continue après le bloc entier pour ne lire que le niveau 1
+        pos = i + len(bloc) + 2
+    return resultats
+
+
 def parser_objets(texte, type_attendu):
-    """Renvoie {nom: bloc_texte} pour les objets d'un type donné."""
+    """Renvoie {nom: bloc} pour les objets 'type_attendu nom {' de premier niveau."""
     objets = {}
-    for m in RE_OBJET.finditer(texte):
-        if m.group(1) == type_attendu:
-            objets[m.group(2)] = _bloc(texte, m.end() - 1)
+    for entete, bloc in _lignes_blocs_niveau1(texte):
+        mots = entete.split()
+        if len(mots) >= 2 and type_attendu in mots[:-1]:
+            # ex: 'gtm wideip www.example.com' ou 'wideip www.example.com'
+            idx = mots.index(type_attendu)
+            if idx + 1 < len(mots):
+                objets[mots[idx + 1]] = bloc
     return objets
 
 
+def sous_bloc(bloc, mot_cle):
+    """Renvoie le contenu du sous-bloc 'mot_cle {' dans bloc, ou None."""
+    for entete, contenu in _lignes_blocs_niveau1_ou_profonds(bloc):
+        if entete.split() and entete.split()[-1] == mot_cle:
+            return contenu
+    return None
+
+
+def _lignes_blocs_niveau1_ou_profonds(texte):
+    """Tous les blocs 'entête {' du texte, y compris imbriqués."""
+    resultats = []
+    for m in re.finditer(r"([^\n{}]*)\{", texte):
+        entete = m.group(1).strip()
+        contenu = _bloc(texte, m.end() - 1)
+        resultats.append((entete, contenu))
+    return resultats
+
+
+def entrees_sous_bloc(bloc_sous, ):
+    """Renvoie les noms d'entrées d'un sous-bloc (un nom par ligne, suivi de '{' ou non).
+
+    Gère 'nom {', 'nom { ratio 1 }', 'nom' seul sur une ligne, et 'nom:port'.
+    """
+    noms = []
+    for ligne in bloc_sous.splitlines():
+        ligne = ligne.strip()
+        if not ligne or ligne in ("{", "}"):
+            continue
+        m = re.match(r"^(/?[^\s{}]+)", ligne)
+        if m and m.group(1) not in ("ratio", "order", "priority", "member-order"):
+            noms.append(m.group(1))
+    return noms
+
+
 def pools_du_wideip(bloc_wideip):
-    """Renvoie la liste des noms de pools référencés dans un WideIP."""
-    m = re.search(r"^\s*pools\s*\{", bloc_wideip, re.MULTILINE)
-    if not m:
-        return []
-    contenu = _bloc(bloc_wideip, m.end() - 1)
-    return [x.group(1) for x in re.finditer(
-        r"^\s*(/?\S+)\s*\{", contenu, re.MULTILINE)]
+    sous = sous_bloc(bloc_wideip, "pools")
+    return entrees_sous_bloc(sous) if sous else []
 
 
 def membres_du_pool(bloc_pool):
-    """Renvoie la liste des membres (serveur:service) d'un pool."""
-    m = re.search(r"^\s*members\s*\{", bloc_pool, re.MULTILINE)
-    if not m:
-        return []
-    contenu = _bloc(bloc_pool, m.end() - 1)
-    return [x.group(1) for x in re.finditer(
-        r"^\s*(/?[^\s{}:]+:[^\s{}]+)\s*\{", contenu, re.MULTILINE)]
+    sous = sous_bloc(bloc_pool, "members")
+    return entrees_sous_bloc(sous) if sous else []
 
 
 def construire_arborescence(sortie_wideip, sortie_pool):
-    """Construit le texte de l'arborescence WideIP -> Pool -> Pool member."""
     lignes = []
     lignes.append("ARBORESCENCE GTM : WideIP -> Pool -> Pool member")
     lignes.append("=" * 60)
@@ -170,44 +208,43 @@ def construire_arborescence(sortie_wideip, sortie_pool):
     wideips = parser_objets(sortie_wideip, "wideip")
     pools = parser_objets(sortie_pool, "pool")
 
-    lignes.append("(diagnostic : {} caractère(s) en entrée wideip, {} en entrée pool, "
+    lignes.append("(diagnostic : {} caractère(s) wideip, {} caractère(s) pool, "
                   "{} WideIP et {} pool analysé(s))".format(
                       len(sortie_wideip), len(sortie_pool), len(wideips), len(pools)))
     lignes.append("")
 
     if not wideips:
-        lignes.append("Aucun WideIP trouvé. Voir gtm_wideip_<etat>.txt.")
+        lignes.append("Aucun WideIP analysé. Voir gtm_wideip_<etat>.txt.")
         return "\n".join(lignes) + "\n"
 
-    for nom_wideip, bloc_wideip in sorted(wideips.items()):
+    for nom_wideip in sorted(wideips):
         lignes.append("WideIP : {}".format(nom_wideip))
-        noms_pools = pools_du_wideip(bloc_wideip)
+        noms_pools = pools_du_wideip(wideips[nom_wideip])
         if not noms_pools:
             lignes.append("  └── (aucun pool référencé)")
             lignes.append("")
             continue
 
         for i, nom_pool in enumerate(noms_pools):
-            dernier_pool = (i == len(noms_pools) - 1)
-            branche = "└── " if dernier_pool else "├── "
-            prefixe_pool = "    " if dernier_pool else "│   "
+            dernier = (i == len(noms_pools) - 1)
+            branche = "└── " if dernier else "├── "
+            pref = "    " if dernier else "│   "
             lignes.append("  {}Pool : {}".format(branche, nom_pool))
 
             bloc_pool = pools.get(nom_pool)
             if bloc_pool is None:
-                lignes.append("  {}  └── (pool non trouvé dans la capture)".format(prefixe_pool))
+                lignes.append("  {}└── (pool non trouvé dans la capture)".format(pref))
                 continue
 
             membres = membres_du_pool(bloc_pool)
             if not membres:
-                lignes.append("  {}  └── (aucun pool member)".format(prefixe_pool))
+                lignes.append("  {}└── (aucun pool member)".format(pref))
                 continue
 
             for j, membre in enumerate(membres):
-                dernier_membre = (j == len(membres) - 1)
-                branche_m = "└── " if dernier_membre else "├── "
-                lignes.append("  {}  {}Pool member : {}".format(
-                    prefixe_pool, branche_m, membre))
+                dm = (j == len(membres) - 1)
+                lignes.append("  {}{}Pool member : {}".format(
+                    pref, "└── " if dm else "├── ", membre))
         lignes.append("")
 
     return "\n".join(lignes) + "\n"
@@ -218,23 +255,24 @@ def construire_arborescence(sortie_wideip, sortie_pool):
 # ---------------------------------------------------------------------------
 
 def capturer_equipement(hote, args, utilisateur, mdp, etat, horodatage):
-    """Capture toutes les commandes GTM d'un équipement et écrit les fichiers."""
     dossier = os.path.join(args.sortie, hote)
     os.makedirs(dossier, exist_ok=True)
 
     print("[*] {} : connexion...".format(hote))
     client = ouvrir_connexion(hote, args.port, utilisateur, mdp)
 
-    sorties = {}
     try:
+        mode = args.shell if args.shell != "auto" else detecter_mode(client)
+        print("    mode utilisé : {}".format(mode))
+
+        sorties = {}
         for nom_fichier, commande in COMMANDES_GTM.items():
             print("    - {}".format(commande))
-            sortie = executer(client, commande, args.shell)
+            sortie = executer(client, commande, mode)
             sorties[nom_fichier] = sortie
             chemin = os.path.join(dossier, "{}_{}.txt".format(nom_fichier, etat))
             with open(chemin, "w", encoding="utf-8") as f:
-                f.write("# {} | {} | {} | {}\n\n".format(
-                    hote, commande, etat, horodatage))
+                f.write("# {} | {} | {} | {}\n\n".format(hote, commande, etat, horodatage))
                 f.write(sortie)
     finally:
         client.close()
@@ -253,8 +291,7 @@ def capturer_equipement(hote, args, utilisateur, mdp, etat, horodatage):
 
 def main():
     parser = argparse.ArgumentParser(description="Capture GTM en lecture seule")
-    parser.add_argument("-f", "--fichier", required=True,
-                        help="fichier contenant la liste des équipements")
+    parser.add_argument("-f", "--fichier", required=True)
     parser.add_argument("--port", type=int, default=22)
     parser.add_argument("--shell", choices=["auto", "bash", "tmsh"], default="auto")
     parser.add_argument("-o", "--sortie", default="capture_gtm")
@@ -275,7 +312,7 @@ def main():
     etat = demander_etat()
     horodatage = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    print("[*] {} équipement(s) à traiter, sortie dans : {}".format(
+    print("[*] {} équipement(s), sortie dans : {}".format(
         len(hotes), os.path.abspath(args.sortie)))
 
     echecs = []
